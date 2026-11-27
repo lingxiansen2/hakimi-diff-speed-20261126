@@ -1,1896 +1,303 @@
-// Compact data-driven symbolic WebAssembly SIMD128 bytecode compiler for zero-JSON exact Myers diff.
-// Compiles directly into a single preallocated Uint8Array in ~1 ms with zero external dependencies.
-
-const I32 = 0x7f, I64 = 0x7e, V128 = 0x7b, VOID = 0x40;
-const KEEP = 0, DELETE = 1, INSERT = 2;
-
-// Standard WASM 1.0 opcodes
-const UNR = 0x00, BLK = 0x02, LOOP = 0x03, IF = 0x04, ELSE = 0x05, END = 0x0b;
-const BR = 0x0c, BRIF = 0x0d, RET = 0x0f, CALL = 0x10, DROP = 0x1a, SEL = 0x1b;
-const GET = 0x20, SET = 0x21, TEE = 0x22, GGET = 0x23, GSET = 0x24;
-const LD32 = 0x28, LD64 = 0x29, LD8 = 0x2d, ST32 = 0x36, ST64 = 0x37, ST8 = 0x3a;
-const MEMSZ = 0x3f, MEMGR = 0x40, I32C = 0x41, I64C = 0x42;
-const EQZ = 0x45, EQ = 0x46, NE = 0x47, LTS = 0x48, LTU = 0x49, GTS = 0x4a, GTU = 0x4b, LES = 0x4c, LEU = 0x4d, GES = 0x4e, GEU = 0x4f;
-const I64EQZ = 0x50, I64EQ = 0x51, I64NE = 0x52;
-const CLZ = 0x67, CTZ = 0x68, POP = 0x69;
-const ADD = 0x6a, SUB = 0x6b, MUL = 0x6c, DIVU = 0x6e, REMU = 0x70, AND = 0x71, OR = 0x72, XOR = 0x73, SHL = 0x74, SHRS = 0x75, SHRU = 0x76;
-const I64CTZ = 0x7a, I64SUB = 0x7d, I64MUL = 0x7e, I64AND = 0x83, I64OR = 0x84, I64XOR = 0x85, I64SHL = 0x86, I64SHRU = 0x88;
-const WRAP = 0xa7, EXTU = 0xad;
-
-// Symbolic multi-byte / SIMD128 / array-access macro opcodes (< 0)
-const LD32U = -1, VLD = -2, VST = -3, VSPLAT8 = -4, VEQ8 = -5, VLTS8 = -6, VBM8 = -7, VOR = -8;
-const MCOPY = -9, MFILL = -10;
-const LA32 = -11, LA64 = -12, LA8 = -13, AP32 = -14;
-const SA32L = -15, SA32C = -16, SA8L = -17, SA8C = -18;
-const LD32_L = -19, ST32_L = -20, ST32_C = -21;
-
-function writeUleb(buf, p, v) {
-  v >>>= 0;
-  while (v >= 0x80) { buf[p++] = (v & 0x7f) | 0x80; v >>>= 7; }
-  buf[p++] = v;
-  return p;
-}
-
-function writeSleb32(buf, p, v) {
-  v |= 0;
-  while (true) {
-    const b = v & 0x7f; v >>= 7;
-    if ((v === 0 && (b & 0x40) === 0) || (v === -1 && (b & 0x40) !== 0)) { buf[p++] = b; return p; }
-    buf[p++] = b | 0x80;
-  }
-}
-
-function writeSleb64LH(buf, p, lo, hi) {
-  lo >>>= 0; hi |= 0;
-  while (true) {
-    const b = lo & 0x7f;
-    lo = ((lo >>> 7) | (hi << 25)) >>> 0;
-    hi >>= 7;
-    if ((hi === 0 && lo === 0 && (b & 0x40) === 0) || (hi === -1 && lo === 0xffffffff && (b & 0x40) !== 0)) { buf[p++] = b; return p; }
-    buf[p++] = b | 0x80;
-  }
-}
-
-function encodeBody(ops, out, p) {
-  let op, v, g, idx, val;
-  for (let i = 0; i < ops.length; ) {
-    op = ops[i++];
-    if (op >= 0x45) {
-      out[p++] = op;
-    } else if (op >= 0) {
-      out[p++] = op;
-      switch (op) {
-        case I32C:
-          v = ops[i++];
-          if (v >= -64 && v < 64) out[p++] = v & 0x7f;
-          else p = writeSleb32(out, p, v);
-          break;
-        case I64C:
-          p = writeSleb64LH(out, p, ops[i++], ops[i++]);
-          break;
-        case GET: case SET: case TEE: case GGET: case GSET: case CALL: case BR: case BRIF:
-          v = ops[i++];
-          if (v < 128) out[p++] = v; else p = writeUleb(out, p, v);
-          break;
-        case LD32: case ST32:
-          out[p++] = 2; v = ops[i++];
-          if (v < 128) out[p++] = v; else p = writeUleb(out, p, v);
-          break;
-        case LD64: case LD8: case ST64: case ST8:
-          out[p++] = 0; v = ops[i++];
-          if (v < 128) out[p++] = v; else p = writeUleb(out, p, v);
-          break;
-        case BLK: case LOOP: case IF:
-          out[p++] = ops[i++];
-          break;
-        case MEMSZ: case MEMGR:
-          out[p++] = 0;
-          break;
-      }
-    } else {
-      switch (op) {
-        case LD32U: out[p++] = LD32; out[p++] = 0; v = ops[i++]; if (v < 128) out[p++] = v; else p = writeUleb(out, p, v); break;
-        case VLD: out[p++] = 0xfd; out[p++] = 0x00; out[p++] = 0; v = ops[i++]; if (v < 128) out[p++] = v; else p = writeUleb(out, p, v); break;
-        case VST: out[p++] = 0xfd; out[p++] = 0x0b; out[p++] = 0; v = ops[i++]; if (v < 128) out[p++] = v; else p = writeUleb(out, p, v); break;
-        case VSPLAT8: out[p++] = 0xfd; out[p++] = 0x0f; break;
-        case VEQ8: out[p++] = 0xfd; out[p++] = 0x23; break;
-        case VLTS8: out[p++] = 0xfd; out[p++] = 0x25; break;
-        case VBM8: out[p++] = 0xfd; out[p++] = 0x64; break;
-        case VOR: out[p++] = 0xfd; out[p++] = 0x50; break;
-        case MCOPY: out[p++] = 0xfc; out[p++] = 0x0a; out[p++] = 0; out[p++] = 0; break;
-        case MFILL: out[p++] = 0xfc; out[p++] = 0x0b; out[p++] = 0; break;
-        case LA32:
-          g = ops[i++]; idx = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD; out[p++] = LD32; out[p++] = 2; out[p++] = 0;
-          break;
-        case LA64:
-          g = ops[i++]; idx = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 3; out[p++] = SHL; out[p++] = ADD; out[p++] = LD64; out[p++] = 0; out[p++] = 0;
-          break;
-        case LA8:
-          g = ops[i++]; idx = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = ADD; out[p++] = LD8; out[p++] = 0; out[p++] = 0;
-          break;
-        case AP32:
-          g = ops[i++]; idx = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD;
-          break;
-        case SA32L:
-          g = ops[i++]; idx = ops[i++]; val = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD;
-          out[p++] = GET; out[p++] = val; out[p++] = ST32; out[p++] = 2; out[p++] = 0;
-          break;
-        case SA32C:
-          g = ops[i++]; idx = ops[i++]; val = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD;
-          out[p++] = I32C; if (val >= -64 && val < 64) out[p++] = val & 0x7f; else p = writeSleb32(out, p, val);
-          out[p++] = ST32; out[p++] = 2; out[p++] = 0;
-          break;
-        case SA8L:
-          g = ops[i++]; idx = ops[i++]; val = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = ADD; out[p++] = GET; out[p++] = val; out[p++] = ST8; out[p++] = 0; out[p++] = 0;
-          break;
-        case SA8C:
-          g = ops[i++]; idx = ops[i++]; val = ops[i++];
-          out[p++] = GGET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = ADD; out[p++] = I32C; out[p++] = val & 0x7f; out[p++] = ST8; out[p++] = 0; out[p++] = 0;
-          break;
-        case LD32_L:
-          g = ops[i++]; idx = ops[i++];
-          out[p++] = GET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD; out[p++] = LD32; out[p++] = 2; out[p++] = 0;
-          break;
-        case ST32_L:
-          g = ops[i++]; idx = ops[i++]; val = ops[i++];
-          out[p++] = GET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD;
-          out[p++] = GET; out[p++] = val; out[p++] = ST32; out[p++] = 2; out[p++] = 0;
-          break;
-        case ST32_C:
-          g = ops[i++]; idx = ops[i++]; val = ops[i++];
-          out[p++] = GET; out[p++] = g; out[p++] = GET; out[p++] = idx;
-          out[p++] = I32C; out[p++] = 2; out[p++] = SHL; out[p++] = ADD;
-          out[p++] = I32C; if (val >= -64 && val < 64) out[p++] = val & 0x7f; else p = writeSleb32(out, p, val);
-          out[p++] = ST32; out[p++] = 2; out[p++] = 0;
-          break;
-      }
-    }
-  }
-  return p;
-}
-
+// Compact symbolic WASM SIMD128 compiler: passive headers, SIMD128 predictive line matcher + 64-bit SWAR hash, sufDel/sufIns slab LB.
+const I=0x7f,J=0x7e,W=0x7b,V=0x40;
+const KP=0,DL=1,IN=2;
+const UN=0x00,K=0x02,O=0x03,U=0x04,H=0x05,E=0x0b;
+const R=0x0c,F=0x0d,X=0x0f,Y=0x10,D=0x1a,Z=0x1b;
+const G=0x20,S=0x21,T=0x22,P=0x23,Q=0x24;
+const L32=0x28,L64=0x29,L8=0x2d,S32=0x36,S64=0x37,S8=0x3a;
+const MZ=0x3f,MG=0x40,C=0x41,C6=0x42;
+const EZ=0x45,EQ=0x46,NE=0x47,LT=0x48,LU=0x49,GT=0x4a,GU=0x4b,LE=0x4c,LEU=0x4d,GE=0x4e,GEU=0x4f;
+const I6Z=0x50,I6E=0x51,I6N=0x52;
+const CZ=0x67,TZ=0x68,PP=0x69;
+const A=0x6a,B=0x6b,M=0x6c,DV=0x6e,RM=0x70,AN=0x71,OR=0x72,XR=0x73,SL=0x74,SS=0x75,SR=0x76;
+const I6T=0x7a,I6S=0x7d,I6M=0x7e,I6A=0x83,I6O=0x84,I6X=0x85,I6L=0x86,I6R=0x88;
+const WR=0xa7,EX=0xad;
+const U32=-1,VL=-2,VS=-3,VS8=-4,VE8=-5,VL8=-6,VBM=-7,VOR=-8;
+const MCP=-9,MFL=-10,MNT=-11;
+const LA=-12,L6G=-13,L8G=-14,SA=-15,SC=-16,S8G=-17,S8C=-18,LD=-19,ST=-20,SK=-21,BL=-22,EE=-23,IC=-24,DC=-25,GA1=-26,GB1=-27,UV=-28,BF1=-29,R0=-30,C0=-31,C1=-32,CM1=-33,CM2=-34,SH2=-35;
+const HDR_STR = 'makefun-diff/1 old= new= hunks= deleted= inserted=@ ';
+const HDR_MAP = { 'makefun-diff/1 old=': [0, 19], ' new=': [19, 5], ' hunks=': [24, 7], ' deleted=': [31, 9], ' inserted=': [40, 10], '@ ': [50, 2] };
+function writeUleb(b,p,v) {v >>>= 0;while (v >= 0x80) { b[p++]=(v & 0x7f) | 0x80; v >>>= 7; }b[p++]=v;
+return p;}
+function writeSleb32(b,p,v) {v |= 0;
+for (;;) {
+const x=v & 0x7f; v >>= 7;
+if ((v === 0 && (x & 0x40) === 0) || (v === -1 && (x & 0x40) !== 0)) { b[p++]=x; return p; }b[p++]=x | 0x80;}}
+function writeSleb64LH(b,p,lo,hi) {lo >>>= 0; hi |= 0;
+for (;;) {
+const x=lo & 0x7f;
+lo=((lo >>> 7) | (hi << 25)) >>> 0;hi >>= 7;
+if ((hi === 0 && lo === 0 && (x & 0x40) === 0) || (hi === -1 && lo === 0xffffffff && (x & 0x40) !== 0)) { b[p++]=x; return p; }b[p++]=x | 0x80;}}
+function encodeBody(ops,out,p) {
+let op,v,g,idx,val;
+for (let i=0; i < ops.length; ) {
+op=ops[i++];
+if (op >= 0x45) {out[p++]=op;
+} else if (op >= 0) {out[p++]=op;
+switch (op) {
+case C: v=ops[i++]; if (v >= -64 && v < 64) out[p++]=v & 0x7f; else p=writeSleb32(out,p,v); break;
+case C6: p=writeSleb64LH(out,p,ops[i++],ops[i++]); break;
+case G: case S: case T: case P: case Q: case Y: case R: case F:
+v=ops[i++]; if (v < 128) out[p++]=v; else p=writeUleb(out,p,v); break;
+case L32: case S32: out[p++]=2; v=ops[i++]; if (v < 128) out[p++]=v; else p=writeUleb(out,p,v); break;
+case L64: case L8: case S64: case S8: out[p++]=0; v=ops[i++]; if (v < 128) out[p++]=v; else p=writeUleb(out,p,v); break;
+case K: case O: case U: out[p++]=ops[i++]; break;
+case MZ: case MG: out[p++]=0; break;}} else {
+switch (op) {
+case U32: out[p++]=L32; out[p++]=0; v=ops[i++]; if (v < 128) out[p++]=v; else p=writeUleb(out,p,v); break;
+case VL: out[p++]=0xfd; out[p++]=0x00; out[p++]=0; v=ops[i++]; if (v < 128) out[p++]=v; else p=writeUleb(out,p,v); break;
+case VS: out[p++]=0xfd; out[p++]=0x0b; out[p++]=0; v=ops[i++]; if (v < 128) out[p++]=v; else p=writeUleb(out,p,v); break;
+case VS8: out[p++]=0xfd; out[p++]=0x0f; break;
+case VE8: out[p++]=0xfd; out[p++]=0x23; break;
+case VL8: out[p++]=0xfd; out[p++]=0x25; break;
+case VBM: out[p++]=0xfd; out[p++]=0x64; break;
+case VOR: out[p++]=0xfd; out[p++]=0x50; break;
+case MCP: out[p++]=0xfc; out[p++]=0x0a; out[p++]=0; out[p++]=0; break;
+case MFL: out[p++]=0xfc; out[p++]=0x0b; out[p++]=0; break;
+case MNT: out[p++]=0xfc; out[p++]=0x08; out[p++]=0; out[p++]=0; break;
+case LA:g=ops[i++]; idx=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=2; out[p++]=SL; out[p++]=A; out[p++]=L32; out[p++]=2; out[p++]=0; break;
+case L6G:g=ops[i++]; idx=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=3; out[p++]=SL; out[p++]=A; out[p++]=L64; out[p++]=0; out[p++]=0; break;
+case L8G:g=ops[i++]; idx=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=A; out[p++]=L8; out[p++]=0; out[p++]=0; break;
+case SA:g=ops[i++]; idx=ops[i++]; val=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=2; out[p++]=SL; out[p++]=A;out[p++]=G; out[p++]=val; out[p++]=S32; out[p++]=2; out[p++]=0; break;
+case SC:g=ops[i++]; idx=ops[i++]; val=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=2; out[p++]=SL; out[p++]=A;
+out[p++]=C; if (val >= -64 && val < 64) out[p++]=val & 0x7f; else p=writeSleb32(out,p,val);out[p++]=S32; out[p++]=2; out[p++]=0; break;
+case S8G:g=ops[i++]; idx=ops[i++]; val=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=A; out[p++]=G; out[p++]=val; out[p++]=S8; out[p++]=0; out[p++]=0; break;
+case S8C:g=ops[i++]; idx=ops[i++]; val=ops[i++];out[p++]=P; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=A; out[p++]=C; out[p++]=val & 0x7f; out[p++]=S8; out[p++]=0; out[p++]=0; break;
+case LD:g=ops[i++]; idx=ops[i++];out[p++]=G; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=2; out[p++]=SL; out[p++]=A; out[p++]=L32; out[p++]=2; out[p++]=0; break;
+case ST:g=ops[i++]; idx=ops[i++]; val=ops[i++];out[p++]=G; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=2; out[p++]=SL; out[p++]=A;out[p++]=G; out[p++]=val; out[p++]=S32; out[p++]=2; out[p++]=0; break;
+case BL:out[p++]=K;out[p++]=V;out[p++]=O;out[p++]=V;break;case EE:out[p++]=E;out[p++]=E;break;case IC:v=ops[i++];out[p++]=G;out[p++]=v;out[p++]=C;out[p++]=1;out[p++]=A;out[p++]=S;out[p++]=v;break;case DC:v=ops[i++];out[p++]=G;out[p++]=v;out[p++]=C;out[p++]=1;out[p++]=B;out[p++]=S;out[p++]=v;break;case GA1:v=ops[i++];out[p++]=G;out[p++]=v;out[p++]=C;out[p++]=1;out[p++]=A;break;case GB1:v=ops[i++];out[p++]=G;out[p++]=v;out[p++]=C;out[p++]=1;out[p++]=B;break;case UV:out[p++]=U;out[p++]=V;break;case BF1:out[p++]=F;out[p++]=1;break;case R0:out[p++]=R;out[p++]=0;break;case C0:out[p++]=C;out[p++]=0;break;case C1:out[p++]=C;out[p++]=1;break;case CM1:out[p++]=C;out[p++]=0x7f;break;case CM2:out[p++]=C;out[p++]=0x7e;break;case SH2:out[p++]=C;out[p++]=2;out[p++]=SL;out[p++]=A;break;case SK:
+g=ops[i++]; idx=ops[i++]; val=ops[i++];out[p++]=G; out[p++]=g; out[p++]=G; out[p++]=idx;out[p++]=C; out[p++]=2; out[p++]=SL; out[p++]=A;
+out[p++]=C; if (val >= -64 && val < 64) out[p++]=val & 0x7f; else p=writeSleb32(out,p,val);out[p++]=S32; out[p++]=2; out[p++]=0; break;}}}
+return p;}
 export function buildDiffWasm() {
-  const types = [];
-  const typeMap = new Map();
-  const internType = (params, results) => {
-    const key = `${params.join(',')}=>${results.join(',')}`;
-    let id = typeMap.get(key);
-    if (id === undefined) { id = types.length; types.push({ params, results }); typeMap.set(key, id); }
-    return id;
-  };
-
-  let gc = 0;
-  const g = () => gc++;
-  const G = {
-    oBase: g(), oLen: g(), nBase: g(), nLen: g(), arenaBase: g(),
-    oStart: g(), nStart: g(), oEnd: g(), nEnd: g(),
-    prefix: g(), suffix: g(), n: g(), m: g(), arenaPtr: g(),
-    oBounds: g(), oHash: g(), nBounds: g(), nHash: g(),
-    buckets: g(), hMask: g(),
-    A: g(), B: g(), cntA: g(), cntB: g(), posB: g(), seen: g(),
-    remDel: g(), remIns: g(), prefUniqA: g(), prefUniqB: g(),
-    tailsVal: g(), tailsA: g(), prevIdx: g(), ancA: g(), ancB: g(), gapD: g(),
-    isUniq: g(), inLIS: g(), usedLIS: g(), isBridge: g(), grid64: g(),
-    segX: g(), segY: g(), segU: g(), numSegs: g(),
-    gVp: g(), gVc: g(), Vp: g(), Vc: g(), repBuf: g(),
-    ckptMeta: g(), ckptData: g(), ckptDataPtr: g(), ckptCap: g(),
-    bShift: g(), bStep: g(), bMask: g(), ansD: g(), ansK: g(), U: g(),
-    revKind: g(), revCount: g(), opLen: g(),
-    changesO: g(), changesP: g(), changesD: g(), changesI: g(), numChanges: g(),
-    hStart: g(), hEnd: g(), numHunks: g(), deleted: g(), inserted: g(),
-    outBase: g(), outEnd: g(), jsonLen: g(), jsonCur: g(), batchOutBase: g(),
-  };
-
-  let fc = 0;
-  const fnId = () => fc++;
-  const F = {
-    ensureMem: fnId(), prepareInput: fnId(), prepareBatch: fnId(),
-    countLines: fnId(), trimPrefixSuffix: fnId(), scanHashSide: fnId(), scanLines: fnId(), internLines: fnId(),
-    buildBoundsAndUB: fnId(), myersSub: fnId(), solveMyers: fnId(), buildChangesAndHunks: fnId(),
-    writeDec: fnId(), pushLineOut: fnId(), buildPatch: fnId(),
-    solveAscii: fnId(), getOutBase: fnId(), getBatchOutBase: fnId(),
-    skipWs: fnId(), skipJsonStr: fnId(), unescapeJsonStr: fnId(), escapeJsonOut: fnId(), expectByte: fnId(), solveBatchJson: fnId(),
-  };
-
-  const funcs = new Array(fc);
-  const def = (id, params, results, build) => {
-    const locals = [];
-    const loc = (t = I32) => { const idx = params.length + locals.length; locals.push(t); return idx; };
-    const ops = build(loc);
-    ops.push(END);
-    funcs[id] = { typeIdx: internType(params, results), locals, ops };
-  };
-
-  // 1. ensureMem(need)
-  def(F.ensureMem, [I32], [], (loc) => {
-    const need = 0, curBytes = loc(), needPages = loc(), curPages = loc();
-    return [
-      MEMSZ, TEE, curPages, I32C, 16, SHL, SET, curBytes,
-      GET, need, GET, curBytes, GTU, IF, VOID,
-        GET, need, I32C, 65535, ADD, I32C, 16, SHRU,
-        GET, curPages, SUB, MEMGR, I32C, -1, EQ, IF, VOID, UNR, END,
-      END,
-    ];
-  });
-
-  // 2. prepareInput(oLen, nLen) -> nBase
-  def(F.prepareInput, [I32, I32], [I32], (loc) => {
-    const oLen = 0, nLen = 1, nBase = loc(), ab = loc();
-    return [
-      I32C, 0, GSET, G.oBase, GET, oLen, GSET, G.oLen,
-      GET, oLen, I32C, 31, ADD, I32C, -16, AND, TEE, nBase, GSET, G.nBase,
-      GET, nLen, GSET, G.nLen,
-      GET, nBase, GET, nLen, ADD, I32C, 31, ADD, I32C, -16, AND, TEE, ab, GSET, G.arenaBase,
-      GET, ab, I32C, 64, ADD, CALL, F.ensureMem,
-      GET, nBase,
-    ];
-  });
-
-  // 3. prepareBatch(jsonLen) -> 0
-  def(F.prepareBatch, [I32], [I32], () => [
-    GET, 0, GSET, G.jsonLen, GET, 0, I32C, 256, ADD, CALL, F.ensureMem, I32C, 0,
-  ]);
-
-  // 4. countLines(ptr, len) -> i32 (SIMD128)
-  def(F.countLines, [I32, I32], [I32], (loc) => {
-    const ptr = 0, len = 1, cnt = loc(), end = loc(), end16 = loc(), p = loc(), nl16 = loc(V128);
-    return [
-      GET, len, EQZ, IF, VOID, I32C, 0, RET, END,
-      I32C, 0, SET, cnt, GET, ptr, SET, p,
-      GET, ptr, GET, len, ADD, TEE, end, I32C, 16, SUB, SET, end16,
-      I32C, 10, VSPLAT8, SET, nl16,
-      BLK, VOID, LOOP, VOID,
-        GET, p, GET, end16, GTS, BRIF, 1,
-        GET, cnt, GET, p, VLD, 0, GET, nl16, VEQ8, VBM8, POP, ADD, SET, cnt,
-        GET, p, I32C, 16, ADD, SET, p,
-        BR, 0,
-      END, END,
-      BLK, VOID, LOOP, VOID,
-        GET, p, GET, end, GEU, BRIF, 1,
-        GET, p, LD8, 0, I32C, 10, EQ, GET, cnt, ADD, SET, cnt,
-        GET, p, I32C, 1, ADD, SET, p,
-        BR, 0,
-      END, END,
-      GET, end, I32C, 1, SUB, LD8, 0, I32C, 10, NE, IF, VOID, GET, cnt, I32C, 1, ADD, SET, cnt, END,
-      GET, cnt,
-    ];
-  });
-
-  // 5. trimPrefixSuffix() (SIMD128)
-  def(F.trimPrefixSuffix, [], [], (loc) => {
-    const oBase = loc(), nBase = loc(), oLen = loc(), nLen = loc(), minL = loc(), p = loc(), min16 = loc();
-    const oPtr = loc(), nPtr = loc(), s = loc(), maxS = loc(), maxS16 = loc(), b1 = loc(), b2 = loc(), mask = loc();
-    return [
-      GGET, G.oBase, SET, oBase, GGET, G.nBase, SET, nBase, GGET, G.oLen, SET, oLen, GGET, G.nLen, SET, nLen,
-      GET, oLen, GET, nLen, GET, oLen, GET, nLen, LTU, SEL, SET, minL,
-      I32C, 0, SET, p, GET, minL, I32C, 16, SUB, SET, min16,
-      BLK, VOID, LOOP, VOID,
-        GET, p, GET, min16, GTS, BRIF, 1,
-        GET, oBase, GET, p, ADD, VLD, 0, GET, nBase, GET, p, ADD, VLD, 0,
-        VEQ8, VBM8, I32C, 0xffff, XOR, TEE, mask, IF, VOID,
-          GET, p, GET, mask, CTZ, ADD, SET, p, BR, 2,
-        END,
-        GET, p, I32C, 16, ADD, SET, p, BR, 0,
-      END, END,
-      BLK, VOID, LOOP, VOID,
-        GET, p, GET, minL, GEU, BRIF, 1,
-        GET, oBase, GET, p, ADD, LD8, 0, GET, nBase, GET, p, ADD, LD8, 0, NE, BRIF, 1,
-        GET, p, I32C, 1, ADD, SET, p, BR, 0,
-      END, END,
-      GET, p, GET, oLen, EQ, GET, p, GET, nLen, EQ, AND, IF, VOID,
-        GET, oBase, GET, oLen, CALL, F.countLines, GSET, G.prefix,
-        I32C, 0, GSET, G.suffix,
-        GET, oLen, GSET, G.oStart, GET, nLen, GSET, G.nStart,
-        GET, oLen, GSET, G.oEnd, GET, nLen, GSET, G.nEnd, RET,
-      END,
-      BLK, VOID, LOOP, VOID,
-        GET, p, EQZ, BRIF, 1,
-        GET, oBase, GET, p, ADD, I32C, 1, SUB, LD8, 0, I32C, 10, EQ, BRIF, 1,
-        GET, p, I32C, 1, SUB, SET, p, BR, 0,
-      END, END,
-      GET, p, GSET, G.oStart, GET, p, GSET, G.nStart,
-      GET, oBase, GET, p, CALL, F.countLines, GSET, G.prefix,
-      GET, oLen, GET, p, SUB, SET, b1, GET, nLen, GET, p, SUB, SET, b2,
-      GET, b1, GET, b2, GET, b1, GET, b2, LTU, SEL, SET, maxS,
-      I32C, 0, SET, s, GET, maxS, I32C, 16, SUB, SET, maxS16,
-      BLK, VOID, LOOP, VOID,
-        GET, s, GET, maxS16, GTS, BRIF, 1,
-        GET, oBase, GET, oLen, ADD, GET, s, SUB, I32C, 16, SUB, VLD, 0,
-        GET, nBase, GET, nLen, ADD, GET, s, SUB, I32C, 16, SUB, VLD, 0,
-        VEQ8, VBM8, I32C, 0xffff, XOR, TEE, mask, IF, VOID,
-          GET, s, GET, mask, I32C, 16, SHL, CLZ, ADD, SET, s, BR, 2,
-        END,
-        GET, s, I32C, 16, ADD, SET, s, BR, 0,
-      END, END,
-      BLK, VOID, LOOP, VOID,
-        GET, s, GET, maxS, GEU, BRIF, 1,
-        GET, oBase, GET, oLen, ADD, GET, s, SUB, I32C, 1, SUB, LD8, 0,
-        GET, nBase, GET, nLen, ADD, GET, s, SUB, I32C, 1, SUB, LD8, 0, NE, BRIF, 1,
-        GET, s, I32C, 1, ADD, SET, s, BR, 0,
-      END, END,
-      GET, oLen, GET, s, SUB, SET, oPtr, GET, nLen, GET, s, SUB, SET, nPtr,
-      GET, s, I32C, 0, GTS, IF, VOID,
-        GET, oPtr, GET, p, EQ, IF, I32, I32C, 1, ELSE, GET, oBase, GET, oPtr, ADD, I32C, 1, SUB, LD8, 0, I32C, 10, EQ, END,
-        GET, nPtr, GET, p, EQ, IF, I32, I32C, 1, ELSE, GET, nBase, GET, nPtr, ADD, I32C, 1, SUB, LD8, 0, I32C, 10, EQ, END,
-        AND, EQZ, IF, VOID,
-          BLK, VOID, LOOP, VOID,
-            GET, oPtr, GET, oLen, GEU, BRIF, 1,
-            GET, oBase, GET, oPtr, ADD, LD8, 0, I32C, 10, EQ, IF, VOID,
-              GET, oPtr, I32C, 1, ADD, SET, oPtr, GET, nPtr, I32C, 1, ADD, SET, nPtr, BR, 2,
-            END,
-            GET, oPtr, I32C, 1, ADD, SET, oPtr, GET, nPtr, I32C, 1, ADD, SET, nPtr, BR, 0,
-          END, END,
-        END,
-      END,
-      GET, oPtr, GSET, G.oEnd, GET, nPtr, GSET, G.nEnd,
-      GET, oBase, GET, oPtr, ADD, GET, oLen, GET, oPtr, SUB, CALL, F.countLines, GSET, G.suffix,
-    ];
-  });
-
-  // 6. scanLines() (SIMD128 + packed oBounds/nBounds)
-  def(F.scanLines, [], [], (loc) => {
-    const n = loc(), m = loc(), minNM = loc(), hCap = loc(), ptr = loc();
-    const ops = [
-      GGET, G.oBase, GGET, G.oStart, ADD, GGET, G.oEnd, GGET, G.oStart, SUB, CALL, F.countLines, TEE, n, GSET, G.n,
-      GGET, G.nBase, GGET, G.nStart, ADD, GGET, G.nEnd, GGET, G.nStart, SUB, CALL, F.countLines, TEE, m, GSET, G.m,
-      GET, n, GET, m, GET, n, GET, m, LTU, SEL, SET, minNM,
-      GGET, G.arenaBase, SET, ptr,
-    ];
-    const alloc = (gVar, emitBytes) => {
-      ops.push(GET, ptr, GSET, gVar, GET, ptr, ...emitBytes, ADD, I32C, 7, ADD, I32C, -8, AND, SET, ptr);
-    };
-    alloc(G.oBounds, [GET, n, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.oHash, [GET, n, I32C, 4, ADD, I32C, 3, SHL]);
-    alloc(G.nBounds, [GET, m, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.nHash, [GET, m, I32C, 4, ADD, I32C, 3, SHL]);
-
-    const scanSidePlain = (baseG, stG, enG, bG) => {
-      const idx = loc(), pos = loc(), end = loc(), base = loc();
-      return [
-        GGET, baseG, SET, base, GGET, stG, SET, pos, GGET, enG, SET, end, I32C, 0, SET, idx,
-        SA32L, bG, idx, pos,
-        BLK, VOID, LOOP, VOID,
-          GET, pos, GET, end, GEU, BRIF, 1,
-          BLK, VOID, LOOP, VOID,
-            GET, pos, GET, end, GEU, BRIF, 1,
-            GET, base, GET, pos, ADD, LD8, 0, I32C, 10, EQ, IF, VOID, GET, pos, I32C, 1, ADD, SET, pos, BR, 2, END,
-            GET, pos, I32C, 1, ADD, SET, pos, BR, 0,
-          END, END,
-          GET, idx, I32C, 1, ADD, SET, idx,
-          SA32L, bG, idx, pos, BR, 0,
-        END, END,
-      ];
-    };
-
-    ops.push(GET, n, EQZ, GET, m, EQZ, OR, IF, VOID);
-    alloc(G.changesO, [I32C, 16]); alloc(G.changesP, [I32C, 16]);
-    alloc(G.changesD, [I32C, 16]); alloc(G.changesI, [I32C, 16]);
-    alloc(G.hStart, [I32C, 16]); alloc(G.hEnd, [I32C, 16]);
-    ops.push(
-      GET, ptr, GSET, G.arenaPtr, GET, ptr, I32C, 64, ADD, CALL, F.ensureMem,
-      GET, n, IF, VOID, ...scanSidePlain(G.oBase, G.oStart, G.oEnd, G.oBounds), END,
-      GET, m, IF, VOID, ...scanSidePlain(G.nBase, G.nStart, G.nEnd, G.nBounds), END,
-      RET, END,
-      I32C, 16, SET, hCap,
-      BLK, VOID, LOOP, VOID,
-        GET, hCap, GET, n, I32C, 1, SHL, GEU, BRIF, 1,
-        GET, hCap, I32C, 1, SHL, SET, hCap, BR, 0,
-      END, END,
-      GET, hCap, I32C, 1, SUB, GSET, G.hMask,
-    );
-
-    alloc(G.buckets, [GET, hCap, I32C, 2, SHL]);
-    alloc(G.A, [GET, n, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.B, [GET, m, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.cntA, [GET, n, I32C, 2, SHL]);
-    alloc(G.cntB, [GET, n, I32C, 2, SHL]);
-    alloc(G.posB, [GET, n, I32C, 2, SHL]);
-    alloc(G.seen, [GET, n, I32C, 2, SHL]);
-    alloc(G.remDel, [GET, n, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.remIns, [GET, m, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.prefUniqA, [GET, n, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.prefUniqB, [GET, m, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.tailsVal, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.tailsA, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.prevIdx, [GET, n, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.ancA, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.ancB, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.gapD, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.isUniq, [GET, n, I32C, 4, ADD]);
-    alloc(G.inLIS, [GET, n, I32C, 4, ADD]);
-    alloc(G.usedLIS, [GET, minNM, I32C, 4, ADD]);
-    alloc(G.isBridge, [GET, minNM, I32C, 4, ADD]);
-    alloc(G.grid64, [I32C, 65 * 65 * 4]);
-    alloc(G.segX, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.segY, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.segU, [GET, minNM, I32C, 4, ADD, I32C, 2, SHL]);
-    alloc(G.gVp, [I32C, 520 * 4]);
-    alloc(G.gVc, [I32C, 520 * 4]);
-
-    ops.push(
-      GET, ptr, GSET, G.arenaPtr, GET, ptr, I32C, 64, ADD, CALL, F.ensureMem,
-      GGET, G.buckets, I32C, 0, GET, hCap, I32C, 2, SHL, MFILL,
-      GGET, G.cntA, I32C, 0, GET, n, I32C, 2, SHL, MFILL,
-      GGET, G.cntB, I32C, 0, GET, n, I32C, 2, SHL, MFILL,
-      GGET, G.oBase, GGET, G.oStart, GGET, G.oEnd, GGET, G.oBounds, GGET, G.oHash, CALL, F.scanHashSide,
-      GGET, G.nBase, GGET, G.nStart, GGET, G.nEnd, GGET, G.nBounds, GGET, G.nHash, CALL, F.scanHashSide,
-    );
-    return ops;
-  });
-
-  // 6b. scanHashSide(base, st, en, bPtr, hPtr)
-  def(F.scanHashSide, [I32, I32, I32, I32, I32], [], (loc) => {
-    const base = 0, pos = 1, end = 2, bPtr = 3, hPtr = 4;
-    const end16 = loc(), end8 = loc(), b = loc(), sh = loc(), mask = loc();
-    const w = loc(I64), x = loc(I64), z = loc(I64), h = loc(I64), tailMask = loc(I64), tailW = loc(I64), nl16 = loc(V128);
-    return [
-      GET, bPtr, GET, pos, ST32, 0,
-      GET, end, I32C, 16, SUB, SET, end16, GET, end, I32C, 8, SUB, SET, end8,
-      I32C, 10, VSPLAT8, SET, nl16,
-      BLK, VOID, LOOP, VOID,
-        GET, pos, GET, end, GEU, BRIF, 1,
-        I64C, 0x84222325, 0xcbf29ce4, SET, h,
-        BLK, VOID,
-          BLK, VOID, LOOP, VOID,
-            GET, pos, GET, end16, GTS, BRIF, 1,
-            GET, base, GET, pos, ADD, VLD, 0, GET, nl16, VEQ8, VBM8, TEE, mask, IF, VOID,
-              GET, mask, CTZ, SET, b,
-              GET, b, I32C, 8, GES, IF, VOID,
-                GET, h, GET, base, GET, pos, ADD, LD64, 0, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h,
-                I64C, -1, -1, I32C, 15, GET, b, SUB, I32C, 3, SHL, EXTU, I64SHRU, SET, tailMask,
-                GET, h, GET, base, GET, pos, ADD, I32C, 8, ADD, LD64, 0, GET, tailMask, I64AND, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h,
-              ELSE,
-                I64C, -1, -1, I32C, 7, GET, b, SUB, I32C, 3, SHL, EXTU, I64SHRU, SET, tailMask,
-                GET, h, GET, base, GET, pos, ADD, LD64, 0, GET, tailMask, I64AND, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h,
-              END,
-              GET, pos, GET, b, ADD, I32C, 1, ADD, SET, pos, BR, 3,
-            END,
-            GET, h, GET, base, GET, pos, ADD, LD64, 0, I64XOR, I64C, 0x1b3, 0x100, I64MUL,
-            GET, base, GET, pos, ADD, I32C, 8, ADD, LD64, 0, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h,
-            GET, pos, I32C, 16, ADD, SET, pos, BR, 0,
-          END, END,
-          BLK, VOID, LOOP, VOID,
-            GET, pos, GET, end8, GTS, BRIF, 1,
-            GET, base, GET, pos, ADD, LD64, 0, TEE, w, I64C, 0x0a0a0a0a, 0x0a0a0a0a, I64XOR, SET, x,
-            GET, x, I64C, 0x01010101, 0x01010101, I64SUB, GET, x, I64C, -1, -1, I64XOR, I64AND,
-            I64C, 0x80808080, 0x80808080, I64AND, TEE, z, I64EQZ, EQZ, IF, VOID,
-              GET, z, I64CTZ, WRAP, I32C, 3, SHRU, SET, b,
-              I64C, -1, -1, I32C, 7, GET, b, SUB, I32C, 3, SHL, EXTU, I64SHRU, SET, tailMask,
-              GET, h, GET, w, GET, tailMask, I64AND, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h,
-              GET, pos, GET, b, ADD, I32C, 1, ADD, SET, pos, BR, 3,
-            END,
-            GET, h, GET, w, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h,
-            GET, pos, I32C, 8, ADD, SET, pos, BR, 0,
-          END, END,
-          I64C, 0, 0, SET, tailW, I32C, 0, SET, sh,
-          BLK, VOID, LOOP, VOID,
-            GET, pos, GET, end, GEU, BRIF, 1,
-            GET, base, GET, pos, ADD, LD8, 0, SET, b,
-            GET, tailW, GET, b, EXTU, GET, sh, EXTU, I64SHL, I64OR, SET, tailW,
-            GET, sh, I32C, 8, ADD, SET, sh,
-            GET, pos, I32C, 1, ADD, SET, pos,
-            GET, b, I32C, 10, EQ, BRIF, 1, BR, 0,
-          END, END,
-          GET, sh, IF, VOID, GET, h, GET, tailW, I64XOR, I64C, 0x1b3, 0x100, I64MUL, SET, h, END,
-        END,
-        GET, bPtr, I32C, 4, ADD, TEE, bPtr, GET, pos, ST32, 0,
-        GET, hPtr, GET, h, ST64, 0, GET, hPtr, I32C, 8, ADD, SET, hPtr,
-        BR, 0,
-      END, END,
-    ];
-  });
-
-  // 7. internLines() (register-cached bases)
-  def(F.internLines, [], [], (loc) => {
-    const n = loc(), m = loc(), hMask = loc(), oBase = loc(), nBase = loc();
-    const oB = loc(), oH = loc(), nB = loc(), nH = loc(), bkts = loc(), aB = loc(), bB = loc(), cAB = loc(), cBB = loc(), pBB = loc();
-    const i = loc(), st = loc(), len = loc(), hi = loc(I64), slot = loc(), bk = loc(), rep = loc(), rs = loc(), k = loc(), p1 = loc(), p2 = loc(), found = loc(), ptr = loc();
-    const checkEq = (base2L, onMatch) => [
-      GET, oBase, GET, rs, ADD, SET, p1, GET, base2L, GET, st, ADD, SET, p2, I32C, 0, SET, k,
-      BLK, VOID,
-        BLK, VOID, LOOP, VOID,
-          GET, k, I32C, 8, ADD, GET, len, GTU, BRIF, 1,
-          GET, p1, GET, k, ADD, LD64, 0, GET, p2, GET, k, ADD, LD64, 0, I64NE, BRIF, 2,
-          GET, k, I32C, 8, ADD, SET, k, BR, 0,
-        END, END,
-        BLK, VOID, LOOP, VOID,
-          GET, k, GET, len, GEU, BRIF, 1,
-          GET, p1, GET, k, ADD, LD8, 0, GET, p2, GET, k, ADD, LD8, 0, NE, BRIF, 2,
-          GET, k, I32C, 1, ADD, SET, k, BR, 0,
-        END, END,
-        ...onMatch,
-      END,
-    ];
-    return [
-      GGET, G.n, SET, n, GGET, G.m, SET, m, GGET, G.hMask, SET, hMask, GGET, G.oBase, SET, oBase, GGET, G.nBase, SET, nBase,
-      GGET, G.oBounds, SET, oB, GGET, G.oHash, SET, oH, GGET, G.nBounds, SET, nB, GGET, G.nHash, SET, nH,
-      GGET, G.buckets, SET, bkts, GGET, G.A, SET, aB, GGET, G.B, SET, bB, GGET, G.cntA, SET, cAB, GGET, G.cntB, SET, cBB, GGET, G.posB, SET, pBB,
-      I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, n, GEU, BRIF, 1,
-        GET, oB, GET, i, I32C, 2, SHL, ADD, TEE, ptr, LD32, 0, TEE, st, DROP,
-        GET, ptr, LD32, 4, GET, st, SUB, SET, len,
-        GET, oH, GET, i, I32C, 3, SHL, ADD, LD64, 0, TEE, hi,
-        GET, hi, I64C, 32, 0, I64SHRU, I64XOR, WRAP, GET, hMask, AND, SET, slot,
-        BLK, VOID, LOOP, VOID,
-          LD32_L, bkts, slot, TEE, bk, EQZ, IF, VOID,
-            GET, bkts, GET, slot, I32C, 2, SHL, ADD, GET, i, I32C, 1, ADD, ST32, 0,
-            ST32_L, aB, i, i, ST32_C, cAB, i, 1, BR, 2,
-          END,
-          GET, bk, I32C, 1, SUB, SET, rep,
-          GET, oH, GET, rep, I32C, 3, SHL, ADD, LD64, 0, GET, hi, I64EQ,
-          GET, oB, GET, rep, I32C, 2, SHL, ADD, TEE, ptr, LD32, 4, GET, ptr, LD32, 0, TEE, rs, SUB, GET, len, EQ, AND, IF, VOID,
-            ...checkEq(oBase, [
-              ST32_L, aB, i, rep,
-              GET, cAB, GET, rep, I32C, 2, SHL, ADD, TEE, ptr, GET, ptr, LD32, 0, I32C, 1, ADD, ST32, 0,
-              BR, 3,
-            ]),
-          END,
-          GET, slot, I32C, 1, ADD, GET, hMask, AND, SET, slot, BR, 0,
-        END, END,
-        GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-      I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, m, GEU, BRIF, 1,
-        GET, nB, GET, i, I32C, 2, SHL, ADD, TEE, ptr, LD32, 0, TEE, st, DROP,
-        GET, ptr, LD32, 4, GET, st, SUB, SET, len,
-        GET, nH, GET, i, I32C, 3, SHL, ADD, LD64, 0, TEE, hi,
-        GET, hi, I64C, 32, 0, I64SHRU, I64XOR, WRAP, GET, hMask, AND, SET, slot,
-        I32C, -3, SET, found,
-        BLK, VOID, LOOP, VOID,
-          LD32_L, bkts, slot, TEE, bk, EQZ, BRIF, 1,
-          GET, bk, I32C, 1, SUB, SET, rep,
-          GET, oH, GET, rep, I32C, 3, SHL, ADD, LD64, 0, GET, hi, I64EQ,
-          GET, oB, GET, rep, I32C, 2, SHL, ADD, TEE, ptr, LD32, 4, GET, ptr, LD32, 0, TEE, rs, SUB, GET, len, EQ, AND, IF, VOID,
-            ...checkEq(nBase, [
-              GET, rep, SET, found,
-              GET, cBB, GET, rep, I32C, 2, SHL, ADD, TEE, ptr, GET, ptr, LD32, 0, I32C, 1, ADD, ST32, 0,
-              ST32_L, pBB, rep, i, BR, 3,
-            ]),
-          END,
-          GET, slot, I32C, 1, ADD, GET, hMask, AND, SET, slot, BR, 0,
-        END, END,
-        ST32_L, bB, i, found, GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-    ];
-  });
-
-  // 8. buildBoundsAndUB() -> U (also computes LB, isBridge, and certified splits segX/segY/segU)
-  def(F.buildBoundsAndUB, [], [I32], (loc) => {
-    const n = loc(), m = loc(), i = loc(), acc = loc(), id = loc(), sc = loc(), kTotal = loc(), tLen = loc();
-    const j = loc(), lo = loc(), hi = loc(), mid = loc(), cur = loc(), k = loc(), kHint = loc(), pk = loc(), kr = loc(), kl = loc(), steps = loc();
-    const pa = loc(), pb = loc(), minA = loc(), minB = loc(), gx = loc(), gy = loc(), row = loc(), nxt = loc();
-    const U = loc(), g = loc(), x0 = loc(), y0 = loc(), gn = loc(), gm = loc(), maxGD = loc(), sA = loc(), sB = loc();
-    const d = loc(), idx = loc(), diag = loc(), xr = loc(), xa = loc(), cr = loc(), ca = loc(), nx = loc(), ny = loc(), solved = loc(), tmp = loc();
-    const LB = loc(), slack = loc(), maxB = loc(), minB2 = loc(), ex = loc(), ey = loc(), w = loc(), ns = loc(), curU = loc(), lastG = loc(), endG = loc();
-    const aB = loc(), bB = loc(), gvP = loc(), gvC = loc(), xaB = loc(), ybB = loc();
-    return [
-      GGET, G.n, SET, n, GGET, G.m, SET, m,
-      GGET, G.A, SET, aB, GGET, G.B, SET, bB, GGET, G.gVp, SET, gvP, GGET, G.gVc, SET, gvC,
-      GGET, G.seen, I32C, 0, GET, n, I32C, 2, SHL, MFILL,
-      I32C, 0, SET, acc, GET, n, I32C, 1, SUB, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, I32C, 0, LTS, BRIF, 1,
-        LA32, G.A, i, SET, id,
-        LA32, G.seen, id, I32C, 1, ADD, SET, sc, SA32L, G.seen, id, sc,
-        GET, sc, LA32, G.cntB, id, GTS, IF, VOID, GET, acc, I32C, 1, ADD, SET, acc, END,
-        SA32L, G.remDel, i, acc, GET, i, I32C, 1, SUB, SET, i, BR, 0,
-      END, END,
-      SA32C, G.remDel, n, 0,
-
-      GGET, G.seen, I32C, 0, GET, n, I32C, 2, SHL, MFILL,
-      I32C, 0, SET, acc, GET, m, I32C, 1, SUB, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, I32C, 0, LTS, BRIF, 1,
-        LA32, G.B, i, TEE, id, I32C, -3, EQ, IF, VOID,
-          GET, acc, I32C, 1, ADD, SET, acc,
-        ELSE,
-          LA32, G.seen, id, I32C, 1, ADD, SET, sc, SA32L, G.seen, id, sc,
-          GET, sc, LA32, G.cntA, id, GTS, IF, VOID, GET, acc, I32C, 1, ADD, SET, acc, END,
-        END,
-        SA32L, G.remIns, i, acc, GET, i, I32C, 1, SUB, SET, i, BR, 0,
-      END, END,
-      SA32C, G.remIns, m, 0,
-
-      // isUniq + kTotal
-      I32C, 0, SET, kTotal, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, n, GEU, BRIF, 1,
-        LA32, G.cntA, i, I32C, 1, EQ, LA32, G.cntB, i, I32C, 1, EQ, AND, TEE, tmp,
-        GET, kTotal, ADD, SET, kTotal,
-        SA8L, G.isUniq, i, tmp,
-        GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-
-      // prefUniqA & prefUniqB
-      GGET, G.prefUniqA, I32C, 0, ST32, 0,
-      I32C, 0, SET, acc, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, n, GEU, BRIF, 1,
-        LA32, G.A, i, SET, id, GET, acc, LA8, G.isUniq, id, ADD, SET, acc,
-        GET, i, I32C, 1, ADD, TEE, i,
-        SA32L, G.prefUniqA, i, acc, BR, 0,
-      END, END,
-      GGET, G.prefUniqB, I32C, 0, ST32, 0,
-      I32C, 0, SET, acc, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, m, GEU, BRIF, 1,
-        LA32, G.B, i, TEE, id, I32C, 0, GES, IF, VOID, GET, acc, LA8, G.isUniq, id, ADD, SET, acc, END,
-        GET, i, I32C, 1, ADD, TEE, i,
-        SA32L, G.prefUniqB, i, acc, BR, 0,
-      END, END,
-
-      // Patience LIS
-      I32C, 0, SET, tLen, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, n, GEU, BRIF, 1,
-        LA32, G.A, i, SET, id,
-        LA8, G.isUniq, id, IF, VOID,
-          LA32, G.posB, id, SET, j, I32C, 0, SET, lo, GET, tLen, SET, hi,
-          BLK, VOID, LOOP, VOID,
-            GET, lo, GET, hi, GES, BRIF, 1,
-            GET, lo, GET, hi, ADD, I32C, 1, SHRU, SET, mid,
-            LA32, G.tailsVal, mid, GET, j, LTS, IF, VOID, GET, mid, I32C, 1, ADD, SET, lo, ELSE, GET, mid, SET, hi, END,
-            BR, 0,
-          END, END,
-          SA32L, G.tailsVal, lo, j, SA32L, G.tailsA, lo, i,
-          GET, lo, I32C, 0, GTS, IF, I32, GET, lo, I32C, 1, SUB, SET, mid, LA32, G.tailsA, mid, ELSE, I32C, -1, END, SET, tmp,
-          SA32L, G.prevIdx, i, tmp,
-          GET, lo, GET, tLen, EQ, IF, VOID, GET, tLen, I32C, 1, ADD, SET, tLen, END,
-        END,
-        GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-
-      GGET, G.inLIS, I32C, 0, GET, n, MFILL,
-      GET, tLen, I32C, 0, GTS, IF, I32, GET, tLen, I32C, 1, SUB, SET, mid, LA32, G.tailsA, mid, ELSE, I32C, -1, END, SET, cur,
-      GET, tLen, SET, k,
-      BLK, VOID, LOOP, VOID,
-        GET, k, I32C, 1, LTS, BRIF, 1,
-        SA32L, G.ancA, k, cur,
-        LA32, G.A, cur, SET, id, LA32, G.posB, id, SET, tmp, SA32L, G.ancB, k, tmp,
-        SA8C, G.inLIS, cur, 1,
-        LA32, G.prevIdx, cur, SET, cur, GET, k, I32C, 1, SUB, SET, k, BR, 0,
-      END, END,
-      GGET, G.ancA, I32C, -1, ST32, 0, GGET, G.ancB, I32C, -1, ST32, 0,
-      GET, tLen, I32C, 1, ADD, SET, mid, SA32L, G.ancA, mid, n, SA32L, G.ancB, mid, m,
-
-      // isBridge[1..tLen]
-      GGET, G.isBridge, I32C, 0, GET, tLen, I32C, 2, ADD, MFILL,
-      I32C, -1, SET, maxB, I32C, 1, SET, k, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, n, GEU, BRIF, 1,
-        LA32, G.A, i, SET, id,
-        LA8, G.isUniq, id, IF, VOID,
-          LA32, G.posB, id, SET, pb,
-          GET, k, GET, tLen, LES, IF, VOID,
-            LA32, G.ancA, k, GET, i, EQ, IF, VOID,
-              GET, maxB, LA32, G.ancB, k, LTS, IF, VOID, SA8C, G.isBridge, k, 1, END,
-              GET, k, I32C, 1, ADD, SET, k,
-            END,
-          END,
-          GET, pb, GET, maxB, GTS, IF, VOID, GET, pb, SET, maxB, END,
-        END,
-        GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-      GET, m, SET, minB2, GET, tLen, SET, k, GET, n, I32C, 1, SUB, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, I32C, 0, LTS, BRIF, 1,
-        LA32, G.A, i, SET, id,
-        LA8, G.isUniq, id, IF, VOID,
-          LA32, G.posB, id, SET, pb,
-          GET, k, I32C, 1, GES, IF, VOID,
-            LA32, G.ancA, k, GET, i, EQ, IF, VOID,
-              GET, minB2, LA32, G.ancB, k, LES, IF, VOID, SA8C, G.isBridge, k, 0, END,
-              GET, k, I32C, 1, SUB, SET, k,
-            END,
-          END,
-          GET, pb, GET, minB2, LTS, IF, VOID, GET, pb, SET, minB2, END,
-        END,
-        GET, i, I32C, 1, SUB, SET, i, BR, 0,
-      END, END,
-
-      // grid64 crossing S_uniq pairs
-      GGET, G.grid64, I32C, 0, I32C, 65 * 65 * 4, MFILL,
-      GGET, G.usedLIS, I32C, 0, GET, tLen, I32C, 2, ADD, MFILL,
-      I32C, 1, SET, kHint, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, n, GEU, BRIF, 1,
-        LA32, G.A, i, SET, id,
-        LA8, G.isUniq, id, LA8, G.inLIS, i, EQZ, AND, IF, VOID,
-          LA32, G.posB, id, SET, j,
-          BLK, VOID, LOOP, VOID,
-            GET, kHint, GET, tLen, GTS, BRIF, 1,
-            LA32, G.ancA, kHint, GET, i, GES, BRIF, 1,
-            GET, kHint, I32C, 1, ADD, SET, kHint, BR, 0,
-          END, END,
-          I32C, -1, SET, pk, GET, kHint, SET, kr, I32C, 0, SET, steps,
-          BLK, VOID, LOOP, VOID,
-            GET, kr, GET, tLen, GTS, GET, steps, I32C, 64, GES, OR, BRIF, 1,
-            LA32, G.ancB, kr, GET, j, GES, BRIF, 1,
-            LA8, G.usedLIS, kr, EQZ, IF, VOID, GET, kr, SET, pk, BR, 2, END,
-            GET, kr, I32C, 1, ADD, SET, kr, GET, steps, I32C, 1, ADD, SET, steps, BR, 0,
-          END, END,
-          GET, pk, I32C, -1, EQ, IF, VOID,
-            GET, kHint, I32C, 1, SUB, SET, kl, I32C, 0, SET, steps,
-            BLK, VOID, LOOP, VOID,
-              GET, kl, I32C, 1, LTS, GET, steps, I32C, 64, GES, OR, BRIF, 1,
-              LA32, G.ancB, kl, GET, j, LES, BRIF, 1,
-              LA8, G.usedLIS, kl, EQZ, IF, VOID, GET, kl, SET, pk, BR, 2, END,
-              GET, kl, I32C, 1, SUB, SET, kl, GET, steps, I32C, 1, ADD, SET, steps, BR, 0,
-            END, END,
-          END,
-          GET, pk, I32C, -1, NE, IF, VOID,
-            SA8C, G.usedLIS, pk, 1,
-            LA32, G.ancA, pk, SET, pa, LA32, G.ancB, pk, SET, pb,
-            GET, i, GET, pa, GET, i, GET, pa, LTS, SEL, SET, minA,
-            GET, j, GET, pb, GET, j, GET, pb, LTS, SEL, SET, minB,
-            GET, minA, I32C, 6, SHL, GET, n, DIVU, SET, gx,
-            GET, minB, I32C, 6, SHL, GET, m, DIVU, SET, gy,
-            GET, gx, I32C, 65, MUL, GET, gy, ADD, SET, mid,
-            LA32, G.grid64, mid, I32C, 1, ADD, SET, tmp, SA32L, G.grid64, mid, tmp,
-          END,
-        END,
-        GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-
-      I32C, 63, SET, gx,
-      BLK, VOID, LOOP, VOID,
-        GET, gx, I32C, 0, LTS, BRIF, 1,
-        GET, gx, I32C, 65, MUL, SET, row, GET, row, I32C, 65, ADD, SET, nxt,
-        I32C, 63, SET, gy,
-        BLK, VOID, LOOP, VOID,
-          GET, gy, I32C, 0, LTS, BRIF, 1,
-          GET, row, GET, gy, ADD, SET, mid,
-          LA32, G.grid64, mid,
-          GET, nxt, GET, gy, ADD, SET, cur, LA32, G.grid64, cur, ADD,
-          GET, mid, I32C, 1, ADD, SET, cur, LA32, G.grid64, cur, ADD,
-          GET, nxt, GET, gy, ADD, I32C, 1, ADD, SET, cur, LA32, G.grid64, cur, SUB, SET, tmp,
-          SA32L, G.grid64, mid, tmp,
-          GET, gy, I32C, 1, SUB, SET, gy, BR, 0,
-        END, END,
-        GET, gx, I32C, 1, SUB, SET, gx, BR, 0,
-      END, END,
-
-      // Gap Myers for U and gapD[0..tLen] (register-cached bases)
-      I32C, 0, SET, U, I32C, 0, SET, g,
-      BLK, VOID, LOOP, VOID,
-        GET, g, GET, tLen, GTS, BRIF, 1,
-        LA32, G.ancA, g, I32C, 1, ADD, SET, x0, LA32, G.ancB, g, I32C, 1, ADD, SET, y0,
-        GET, g, I32C, 1, ADD, SET, mid,
-        LA32, G.ancA, mid, GET, x0, SUB, SET, gn, LA32, G.ancB, mid, GET, y0, SUB, SET, gm,
-        GET, aB, GET, x0, I32C, 2, SHL, ADD, SET, xaB,
-        GET, bB, GET, y0, I32C, 2, SHL, ADD, SET, ybB,
-        BLK, VOID, LOOP, VOID,
-          GET, gn, I32C, 0, LES, GET, gm, I32C, 0, LES, OR, BRIF, 1,
-          GET, xaB, LD32, 0, GET, ybB, LD32, 0, NE, BRIF, 1,
-          GET, x0, I32C, 1, ADD, SET, x0, GET, y0, I32C, 1, ADD, SET, y0,
-          GET, xaB, I32C, 4, ADD, SET, xaB, GET, ybB, I32C, 4, ADD, SET, ybB,
-          GET, gn, I32C, 1, SUB, SET, gn, GET, gm, I32C, 1, SUB, SET, gm, BR, 0,
-        END, END,
-        BLK, VOID, LOOP, VOID,
-          GET, gn, I32C, 0, LES, GET, gm, I32C, 0, LES, OR, BRIF, 1,
-          GET, gn, I32C, 1, SUB, SET, cur,
-          GET, gm, I32C, 1, SUB, SET, mid,
-          LD32_L, xaB, cur, LD32_L, ybB, mid, NE, BRIF, 1,
-          GET, cur, SET, gn, GET, mid, SET, gm, BR, 0,
-        END, END,
-        I32C, 0, SET, tmp, // gap result
-        BLK, VOID,
-          GET, gn, EQZ, IF, VOID, GET, gm, SET, tmp, BR, 1, END,
-          GET, gm, EQZ, IF, VOID, GET, gn, SET, tmp, BR, 1, END,
-          GET, gn, GET, gm, ADD, SET, mid,
-          I32C, 256, GET, mid, I32C, 256, GET, mid, LTS, SEL, SET, maxGD,
-          GET, x0, GET, gn, ADD, SET, cur, LD32_L, aB, cur, SET, sA,
-          GET, y0, GET, gm, ADD, SET, mid, LD32_L, bB, mid, SET, sB,
-          ST32_C, aB, cur, -1, ST32_C, bB, mid, -2,
-          I32C, 0, SET, gx,
-          BLK, VOID, LOOP, VOID,
-            LD32_L, xaB, gx, LD32_L, ybB, gx, NE, BRIF, 1,
-            GET, gx, I32C, 1, ADD, SET, gx, BR, 0,
-          END, END,
-          GET, gvP, GET, gx, ST32, 0,
-          I32C, 0, SET, solved, I32C, 1, SET, d,
-          BLK, VOID, LOOP, VOID,
-            GET, d, GET, maxGD, GTS, BRIF, 1,
-            I32C, 0, SET, idx, I32C, 0, GET, d, SUB, SET, diag,
-            BLK, VOID, LOOP, VOID,
-              GET, idx, GET, d, GTS, BRIF, 1,
-              GET, idx, I32C, 0, GTS, IF, I32, GET, idx, I32C, 1, SUB, SET, lo, LD32_L, gvP, lo, ELSE, I32C, -2, END, SET, xr,
-              GET, idx, GET, d, LTS, IF, I32, LD32_L, gvP, idx, ELSE, I32C, -2, END, SET, xa,
-              GET, xr, I32C, 0, GES, GET, xr, GET, gn, LTS, AND, SET, cr,
-              GET, xa, I32C, 0, GES, GET, xa, GET, diag, SUB, I32C, 1, SUB, GET, gm, LTS, AND, SET, ca,
-              GET, cr, GET, ca, EQZ, GET, xr, I32C, 1, ADD, GET, xa, GES, OR, AND,
-              IF, I32, GET, xr, I32C, 1, ADD, ELSE, GET, ca, IF, I32, GET, xa, ELSE, I32C, -2, END, END, SET, nx,
-              GET, nx, I32C, 0, LTS, IF, VOID, ST32_C, gvC, idx, -2,
-              ELSE,
-                GET, nx, GET, diag, SUB, SET, ny,
-                BLK, VOID, LOOP, VOID,
-                  LD32_L, xaB, nx, LD32_L, ybB, ny, NE, BRIF, 1,
-                  GET, nx, I32C, 1, ADD, SET, nx, GET, ny, I32C, 1, ADD, SET, ny, BR, 0,
-                END, END,
-                GET, nx, GET, gn, EQ, GET, ny, GET, gm, EQ, AND, IF, VOID,
-                  GET, d, SET, tmp, I32C, 1, SET, solved, BR, 5,
-                END,
-                ST32_L, gvC, idx, nx,
-              END,
-              GET, idx, I32C, 1, ADD, SET, idx, GET, diag, I32C, 2, ADD, SET, diag, BR, 0,
-            END, END,
-            GET, gvP, SET, lo, GET, gvC, SET, gvP, GET, lo, SET, gvC,
-            GET, d, I32C, 1, ADD, SET, d, BR, 0,
-          END, END,
-          ST32_L, aB, cur, sA, ST32_L, bB, mid, sB,
-          GET, solved, EQZ, IF, VOID, GET, gn, GET, gm, ADD, SET, tmp, END,
-        END,
-        SA32L, G.gapD, g, tmp,
-        GET, U, GET, tmp, ADD, SET, U,
-        GET, g, I32C, 1, ADD, SET, g, BR, 0,
-      END, END,
-      GET, U, GSET, G.U,
-
-      // Certified-Anchor Decomposition: compute LB, slack = U - LB, find certified snake-ends
-      GGET, G.remDel, LD32, 0, GGET, G.remIns, LD32, 0, ADD, GET, kTotal, GET, tLen, SUB, I32C, 1, SHL, ADD, SET, LB,
-      GET, U, GET, LB, SUB, SET, slack,
-      GGET, G.segX, I32C, 0, ST32, 0, GGET, G.segY, I32C, 0, ST32, 0,
-      I32C, 0, SET, ns, I32C, 0, SET, cur, I32C, 0, SET, lastG, I32C, 1, SET, k,
-      BLK, VOID, LOOP, VOID,
-        GET, k, GET, tLen, GTS, BRIF, 1,
-        LA32, G.ancA, k, SET, ex, LA32, G.ancB, k, SET, ey,
-        GET, ex, GET, cur, LTS, IF, VOID, GET, k, I32C, 1, ADD, SET, k, BR, 1, END,
-        // Count isBridge anchors in maximal snake starting at (ex, ey)
-        I32C, 0, SET, w, GET, k, SET, endG,
-        BLK, VOID, LOOP, VOID,
-          GET, ex, GET, n, GES, GET, ey, GET, m, GES, OR, BRIF, 1,
-          LA32, G.A, ex, LA32, G.B, ey, NE, BRIF, 1,
-          GET, endG, GET, tLen, LES, IF, VOID,
-            LA32, G.ancA, endG, GET, ex, EQ, IF, VOID,
-              GET, w, LA8, G.isBridge, endG, ADD, SET, w,
-              GET, endG, I32C, 1, ADD, SET, endG,
-            END,
-          END,
-          GET, ex, I32C, 1, ADD, SET, ex, GET, ey, I32C, 1, ADD, SET, ey, BR, 0,
-        END, END,
-        // Note: (ex, ey) is snake-end (A[ex] !== B[ey] or EOF).
-        // Certified if (ex < n && ey < m) && ((w << 1) > slack)
-        GET, ex, GET, n, LTS, GET, ey, GET, m, LTS, AND,
-        GET, w, I32C, 1, SHL, GET, slack, GTS, AND, IF, VOID,
-          I32C, 0, SET, curU, GET, lastG, SET, g,
-          BLK, VOID, LOOP, VOID,
-            GET, g, GET, k, GES, BRIF, 1,
-            GET, curU, LA32, G.gapD, g, ADD, SET, curU,
-            GET, g, I32C, 1, ADD, SET, g, BR, 0,
-          END, END,
-          SA32L, G.segU, ns, curU,
-          GET, ns, I32C, 1, ADD, SET, ns,
-          SA32L, G.segX, ns, ex, SA32L, G.segY, ns, ey,
-          GET, ex, SET, cur, GET, endG, I32C, 1, SUB, SET, lastG,
-        END,
-        GET, endG, SET, k, BR, 0,
-      END, END,
-      // Final segment to (n, m)
-      I32C, 0, SET, curU, GET, lastG, SET, g,
-      BLK, VOID, LOOP, VOID,
-        GET, g, GET, tLen, GTS, BRIF, 1,
-        GET, curU, LA32, G.gapD, g, ADD, SET, curU,
-        GET, g, I32C, 1, ADD, SET, g, BR, 0,
-      END, END,
-      SA32L, G.segU, ns, curU,
-      GET, ns, I32C, 1, ADD, TEE, ns, GSET, G.numSegs,
-      SA32L, G.segX, ns, n, SA32L, G.segY, ns, m,
-      GET, U,
-    ];
-  });
-
-  // 9. myersSub(x0, y0, x1, y1, uSub, useGlobalPrune): runs forward Myers + backward replay on [x0..x1) x [y0..y1)
-  // Appends reverse ops directly to G.revKind / G.revCount (so caller loops seg = numSegs-1 down to 0).
-  def(F.myersSub, [I32, I32, I32, I32, I32, I32], [], (loc) => {
-    const x0p = 0, y0p = 1, x1p = 2, y1p = 3, uSub = 4, usePrune = 5;
-    const n = loc(), m = loc(), delta = loc(), ptr = loc(), sA = loc(), sB = loc();
-    const aBase = loc(), bBase = loc(), vpBase = loc(), vcBase = loc();
-    const bShift = loc(), bStep = loc(), bMask = loc(), nCkpts = loc();
-    const xs = loc(), kLo = loc(), kHi = loc(), hitBound = loc(), d = loc(), remD = loc(), lim1 = loc(), lim2 = loc();
-    const loK = loc(), hiK = loc(), iLo = loc(), iHi = loc(), idx = loc(), k = loc(), endIdx = loc();
-    const xRem = loc(), xAdd = loc(), nx = loc(), ny = loc(), canRem = loc(), canAdd = loc();
-    const qx = loc(), qy = loc(), cc = loc(), pa = loc(), pb = loc(), exIns = loc(), exDel = loc(), tmp = loc();
-    const cCount = loc(), metaPtr = loc(), bytesNeed = loc(), ansD = loc(), ansK = loc();
-    const stride = loc(), opLen = loc(), curD = loc(), curK = loc(), curX = loc(), bIdx = loc(), d0 = loc(), span = loc();
-    const ckData = loc(), ckILo = loc(), fLo0 = loc(), fHi0 = loc(), baseK0 = loc(), rLo0 = loc(), rHi0 = loc();
-    const pLo = loc(), pHi = loc(), s = loc(), wLo = loc(), wHi = loc(), rLo = loc(), rHi = loc();
-    const prevRow = loc(), curRow = loc(), shiftBase = loc(), cILo = loc(), cIHi = loc(), col = loc();
-    const traceX = loc(), traceK = loc(), startX = loc(), opK = loc(), nextK = loc(), prevX = loc(), keep = loc();
-
-    const pushOp = (kindOps, cntOps) => [
-      GET, opLen, I32C, 0, GTS, IF, I32, GET, opLen, I32C, 1, SUB, SET, tmp, LA8, G.revKind, tmp, ...kindOps, EQ, ELSE, I32C, 0, END, IF, VOID,
-        GET, opLen, I32C, 1, SUB, SET, tmp, LA32, G.revCount, tmp, ...cntOps, ADD, SET, pa, SA32L, G.revCount, tmp, pa,
-      ELSE,
-        GGET, G.revKind, GET, opLen, ADD, ...kindOps, ST8, 0,
-        GGET, G.revCount, GET, opLen, I32C, 2, SHL, ADD, ...cntOps, ST32, 0,
-        GET, opLen, I32C, 1, ADD, SET, opLen,
-      END,
-    ];
-
-    const emitIsValid = (kL) => [
-      GET, nx, I32C, 6, SHL, GET, n, ADD, I32C, 1, SUB, GET, n, DIVU, SET, qx,
-      GET, ny, I32C, 6, SHL, GET, m, ADD, I32C, 1, SUB, GET, m, DIVU, SET, qy,
-      GET, qx, I32C, 65, MUL, GET, qy, ADD, SET, tmp, LA32, G.grid64, tmp, SET, cc,
-      LA32, G.prefUniqA, nx, SET, pa, LA32, G.prefUniqB, ny, SET, pb,
-      GET, pa, GET, pb, GTS, IF, I32, GET, pa, GET, pb, SUB, ELSE, I32C, 0, END, SET, exIns,
-      GET, pb, GET, pa, GTS, IF, I32, GET, pb, GET, pa, SUB, ELSE, I32C, 0, END, SET, exDel,
-      LA32, G.remIns, ny, GET, exIns, ADD, GET, cc, ADD, I32C, 1, SHL, GET, lim1, GET, kL, ADD, LES,
-      LA32, G.remDel, nx, GET, exDel, ADD, GET, cc, ADD, I32C, 1, SHL, GET, lim2, GET, kL, SUB, LES, AND,
-    ];
-
-    return [
-      GET, x1p, GET, x0p, SUB, SET, n, GET, y1p, GET, y0p, SUB, SET, m,
-      GGET, G.opLen, SET, opLen,
-      GET, n, EQZ, GET, m, EQZ, AND, IF, VOID, RET, END,
-      GET, n, EQZ, IF, VOID, ...pushOp([I32C, INSERT], [GET, m]), GET, opLen, GSET, G.opLen, RET, END,
-      GET, m, EQZ, IF, VOID, ...pushOp([I32C, DELETE], [GET, n]), GET, opLen, GSET, G.opLen, RET, END,
-
-      GET, n, GET, m, SUB, SET, delta,
-      GET, uSub, I32C, 8192, LES, IF, VOID, I32C, 5, SET, bShift, I32C, 32, SET, bStep, I32C, 31, SET, bMask,
-      ELSE, I32C, 7, SET, bShift, I32C, 128, SET, bStep, I32C, 127, SET, bMask, END,
-      GET, bStep, I32C, 4, ADD, SET, stride,
-
-      // Arena from G.arenaPtr (reused across subproblems; revKind/revCount already allocated before solveMyers)
-      GGET, G.arenaPtr, SET, ptr,
-      GET, ptr, TEE, vpBase, GSET, G.Vp, GET, ptr, GET, uSub, I32C, 8, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, TEE, vcBase, GSET, G.Vc, GET, ptr, GET, uSub, I32C, 8, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.repBuf,
-      GET, ptr, GET, bStep, I32C, 1, ADD, GET, bStep, I32C, 4, ADD, MUL, I32C, 2, SHL, ADD, SET, ptr,
-      GET, uSub, GET, bShift, SHRU, I32C, 2, ADD, SET, nCkpts,
-      GET, ptr, GSET, G.ckptMeta, GET, ptr, GET, nCkpts, I32C, 4, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.ckptData, GET, ptr, GSET, G.ckptDataPtr,
-      GET, ptr, I32C, 1048576, ADD, TEE, tmp, GSET, G.ckptCap,
-      GET, tmp, CALL, F.ensureMem,
-
-      GGET, G.A, GET, x0p, I32C, 2, SHL, ADD, SET, aBase,
-      GGET, G.B, GET, y0p, I32C, 2, SHL, ADD, SET, bBase,
-      LA32, G.A, x1p, SET, sA, LA32, G.B, y1p, SET, sB,
-      SA32C, G.A, x1p, -1, SA32C, G.B, y1p, -2,
-
-      GET, vpBase, I32C, -2, GET, uSub, I32C, 8, ADD, I32C, 2, SHL, MFILL,
-      GET, vcBase, I32C, -2, GET, uSub, I32C, 8, ADD, I32C, 2, SHL, MFILL,
-
-      I32C, 0, SET, xs,
-      BLK, VOID, LOOP, VOID,
-        LD32_L, aBase, xs, LD32_L, bBase, xs, NE, BRIF, 1,
-        GET, xs, I32C, 1, ADD, SET, xs, BR, 0,
-      END, END,
-      GET, vpBase, GET, xs, ST32, 0,
-
-      GGET, G.ckptMeta, SET, metaPtr,
-      GET, metaPtr, I32C, 0, ST32, 0, GET, metaPtr, I32C, 0, ST32, 4, GET, metaPtr, I32C, 0, ST32, 8,
-      GET, metaPtr, GGET, G.ckptDataPtr, ST32, 12,
-      GGET, G.ckptDataPtr, GET, xs, ST32, 0,
-      GGET, G.ckptDataPtr, I32C, 4, ADD, GSET, G.ckptDataPtr,
-      I32C, 1, SET, cCount, I32C, 0, SET, ansD, I32C, 0, SET, ansK,
-      I32C, 0, SET, kLo, I32C, 0, SET, kHi,
-      GET, xs, GET, n, GES, GET, xs, GET, m, GES, OR, SET, hitBound,
-
-      GET, xs, GET, n, LTS, GET, xs, GET, m, LTS, OR, IF, VOID,
-        I32C, 1, SET, d,
-        BLK, VOID, LOOP, VOID,
-          GET, d, GET, uSub, GTS, BRIF, 1,
-          GET, uSub, GET, d, SUB, SET, remD,
-          GET, remD, GET, delta, SUB, SET, lim1, GET, remD, GET, delta, ADD, SET, lim2,
-          GET, kLo, I32C, 1, SUB, SET, nx, I32C, 0, GET, lim1, SUB, SET, ny,
-          GET, nx, GET, ny, GET, nx, GET, ny, GTS, SEL, SET, loK,
-          GET, kHi, I32C, 1, ADD, SET, nx, GET, lim2, SET, ny,
-          GET, nx, GET, ny, GET, nx, GET, ny, LTS, SEL, SET, hiK,
-          GET, loK, GET, d, XOR, I32C, 1, AND, IF, VOID, GET, loK, I32C, 1, ADD, SET, loK, END,
-          GET, hiK, GET, d, XOR, I32C, 1, AND, IF, VOID, GET, hiK, I32C, 1, SUB, SET, hiK, END,
-          GET, loK, GET, d, ADD, I32C, 1, SHRS, SET, iLo, GET, hiK, GET, d, ADD, I32C, 1, SHRS, SET, iHi,
-          GET, iLo, I32C, 0, GTS, IF, VOID, GET, iLo, I32C, 1, SUB, SET, tmp, ST32_C, vcBase, tmp, -2, END,
-          GET, iHi, I32C, 1, ADD, SET, tmp, ST32_C, vcBase, tmp, -2,
-
-          GET, hitBound, EQZ, IF, VOID,
-            GET, iLo, SET, idx, GET, loK, SET, k,
-            GET, idx, EQZ, IF, VOID,
-              GET, vpBase, LD32, 0, SET, nx,
-              GET, nx, I32C, 0, LTS, IF, VOID, GET, vcBase, I32C, -2, ST32, 0,
-              ELSE,
-                GET, nx, GET, k, SUB, SET, ny,
-                BLK, VOID, LOOP, VOID,
-                  LD32_L, aBase, nx, LD32_L, bBase, ny, NE, BRIF, 1,
-                  GET, nx, I32C, 1, ADD, SET, nx, GET, ny, I32C, 1, ADD, SET, ny, BR, 0,
-                END, END,
-                GET, nx, GET, n, GES, GET, ny, GET, m, GES, OR, IF, VOID,
-                  I32C, 1, SET, hitBound,
-                  GET, nx, GET, n, EQ, GET, ny, GET, m, EQ, AND, IF, VOID, GET, d, SET, ansD, GET, k, SET, ansK, BR, 6, END,
-                END,
-                GET, vcBase, GET, nx, ST32, 0,
-              END,
-              I32C, 1, SET, idx, GET, k, I32C, 2, ADD, SET, k,
-            END,
-            GET, iHi, GET, d, GET, iHi, GET, d, LTS, SEL, SET, endIdx,
-            GET, endIdx, GET, d, EQ, IF, VOID, GET, d, I32C, 1, SUB, SET, endIdx, END,
-            GET, idx, I32C, 1, SUB, SET, tmp, LD32_L, vpBase, tmp, SET, xRem,
-            BLK, VOID, LOOP, VOID,
-              GET, idx, GET, endIdx, GTS, BRIF, 1,
-              LD32_L, vpBase, idx, SET, xAdd,
-              GET, xRem, I32C, 0, GES, GET, xRem, I32C, 1, ADD, TEE, tmp, GET, xAdd, GES, AND, IF, I32, GET, tmp, ELSE, GET, xAdd, END, SET, nx,
-              GET, nx, I32C, 0, LTS, IF, VOID, ST32_C, vcBase, idx, -2,
-              ELSE,
-                GET, nx, GET, k, SUB, SET, ny,
-                BLK, VOID, LOOP, VOID,
-                  LD32_L, aBase, nx, LD32_L, bBase, ny, NE, BRIF, 1,
-                  GET, nx, I32C, 1, ADD, SET, nx, GET, ny, I32C, 1, ADD, SET, ny, BR, 0,
-                END, END,
-                GET, nx, GET, n, GES, GET, ny, GET, m, GES, OR, IF, VOID,
-                  I32C, 1, SET, hitBound,
-                  GET, nx, GET, n, EQ, GET, ny, GET, m, EQ, AND, IF, VOID, GET, d, SET, ansD, GET, k, SET, ansK, BR, 7, END,
-                END,
-                ST32_L, vcBase, idx, nx,
-              END,
-              GET, xAdd, SET, xRem, GET, idx, I32C, 1, ADD, SET, idx, GET, k, I32C, 2, ADD, SET, k, BR, 0,
-            END, END,
-            GET, iHi, GET, d, EQ, IF, VOID,
-              GET, xRem, I32C, 0, LTS, IF, VOID, ST32_C, vcBase, d, -2,
-              ELSE,
-                GET, xRem, I32C, 1, ADD, SET, nx, GET, nx, GET, d, SUB, SET, ny,
-                BLK, VOID, LOOP, VOID,
-                  LD32_L, aBase, nx, LD32_L, bBase, ny, NE, BRIF, 1,
-                  GET, nx, I32C, 1, ADD, SET, nx, GET, ny, I32C, 1, ADD, SET, ny, BR, 0,
-                END, END,
-                GET, nx, GET, n, GES, GET, ny, GET, m, GES, OR, IF, VOID,
-                  I32C, 1, SET, hitBound,
-                  GET, nx, GET, n, EQ, GET, ny, GET, m, EQ, AND, IF, VOID, GET, d, SET, ansD, GET, d, SET, ansK, BR, 6, END,
-                END,
-                ST32_L, vcBase, d, nx,
-              END,
-            END,
-          ELSE,
-            GET, iLo, SET, idx, GET, loK, SET, k,
-            BLK, VOID, LOOP, VOID,
-              GET, idx, GET, iHi, GTS, BRIF, 1,
-              GET, idx, I32C, 0, GTS, IF, I32, GET, idx, I32C, 1, SUB, SET, tmp, LD32_L, vpBase, tmp, ELSE, I32C, -2, END, SET, xRem,
-              GET, idx, GET, d, LTS, IF, I32, LD32_L, vpBase, idx, ELSE, I32C, -2, END, SET, xAdd,
-              GET, xRem, I32C, 0, GES, GET, xRem, GET, n, LTS, AND, SET, canRem,
-              GET, xAdd, I32C, 0, GES, GET, xAdd, GET, k, SUB, I32C, 1, SUB, GET, m, LTS, AND, SET, canAdd,
-              GET, canRem, GET, canAdd, EQZ, GET, xRem, I32C, 1, ADD, GET, xAdd, GES, OR, AND,
-              IF, I32, GET, xRem, I32C, 1, ADD, ELSE, GET, canAdd, IF, I32, GET, xAdd, ELSE, I32C, -2, END, END, SET, nx,
-              GET, nx, I32C, 0, LTS, IF, VOID, ST32_C, vcBase, idx, -2,
-              ELSE,
-                GET, nx, GET, k, SUB, SET, ny,
-                BLK, VOID, LOOP, VOID,
-                  LD32_L, aBase, nx, LD32_L, bBase, ny, NE, BRIF, 1,
-                  GET, nx, I32C, 1, ADD, SET, nx, GET, ny, I32C, 1, ADD, SET, ny, BR, 0,
-                END, END,
-                GET, nx, GET, n, EQ, GET, ny, GET, m, EQ, AND, IF, VOID, GET, d, SET, ansD, GET, k, SET, ansK, BR, 6, END,
-                ST32_L, vcBase, idx, nx,
-              END,
-              GET, idx, I32C, 1, ADD, SET, idx, GET, k, I32C, 2, ADD, SET, k, BR, 0,
-            END, END,
-          END,
-
-          GET, usePrune, IF, VOID,
-            BLK, VOID, LOOP, VOID,
-              GET, iLo, GET, iHi, GTS, BRIF, 1,
-              LD32_L, vcBase, iLo, SET, nx,
-              GET, nx, I32C, 0, GES, IF, VOID,
-                GET, nx, GET, loK, SUB, SET, ny, ...emitIsValid(loK), BRIF, 2, ST32_C, vcBase, iLo, -2,
-              END,
-              GET, iLo, I32C, 1, ADD, SET, iLo, GET, loK, I32C, 2, ADD, SET, loK, BR, 0,
-            END, END,
-            BLK, VOID, LOOP, VOID,
-              GET, iLo, GET, iHi, GTS, BRIF, 1,
-              LD32_L, vcBase, iHi, SET, nx,
-              GET, nx, I32C, 0, GES, IF, VOID,
-                GET, nx, GET, hiK, SUB, SET, ny, ...emitIsValid(hiK), BRIF, 2, ST32_C, vcBase, iHi, -2,
-              END,
-              GET, iHi, I32C, 1, SUB, SET, iHi, GET, hiK, I32C, 2, SUB, SET, hiK, BR, 0,
-            END, END,
-          ELSE,
-            BLK, VOID, LOOP, VOID,
-              GET, iLo, GET, iHi, GTS, BRIF, 1, LD32_L, vcBase, iLo, I32C, 0, GES, BRIF, 1,
-              GET, iLo, I32C, 1, ADD, SET, iLo, GET, loK, I32C, 2, ADD, SET, loK, BR, 0,
-            END, END,
-            BLK, VOID, LOOP, VOID,
-              GET, iLo, GET, iHi, GTS, BRIF, 1, LD32_L, vcBase, iHi, I32C, 0, GES, BRIF, 1,
-              GET, iHi, I32C, 1, SUB, SET, iHi, GET, hiK, I32C, 2, SUB, SET, hiK, BR, 0,
-            END, END,
-          END,
-
-          GET, loK, SET, kLo, GET, hiK, SET, kHi,
-          GET, vpBase, SET, tmp, GET, vcBase, TEE, vpBase, GSET, G.Vp, GET, tmp, TEE, vcBase, GSET, G.Vc,
-
-          GET, d, GET, bMask, AND, EQZ, IF, VOID,
-            GET, iHi, GET, iLo, SUB, I32C, 1, ADD, I32C, 2, SHL, SET, bytesNeed,
-            GET, bytesNeed, I32C, 0, LTS, IF, VOID, I32C, 0, SET, bytesNeed, END,
-            GGET, G.ckptDataPtr, GET, bytesNeed, ADD, GGET, G.ckptCap, GTU, IF, VOID,
-              GGET, G.ckptDataPtr, GET, bytesNeed, ADD, I32C, 1048576, ADD, TEE, tmp, GSET, G.ckptCap,
-              GET, tmp, CALL, F.ensureMem,
-            END,
-            GGET, G.ckptMeta, GET, cCount, I32C, 4, SHL, ADD, SET, metaPtr,
-            GET, metaPtr, GET, iLo, ST32, 0, GET, metaPtr, GET, loK, ST32, 4, GET, metaPtr, GET, hiK, ST32, 8,
-            GET, metaPtr, GGET, G.ckptDataPtr, ST32, 12,
-            GET, bytesNeed, I32C, 0, GTS, IF, VOID,
-              GGET, G.ckptDataPtr, GET, vpBase, GET, iLo, I32C, 2, SHL, ADD, GET, bytesNeed, MCOPY,
-              GGET, G.ckptDataPtr, GET, bytesNeed, ADD, GSET, G.ckptDataPtr,
-            END,
-            GET, cCount, I32C, 1, ADD, SET, cCount,
-          END,
-          GET, d, I32C, 1, ADD, SET, d, BR, 0,
-        END, END,
-      END,
-
-      // Replay subproblem path from ansD, ansK back to (0, 0)
-      GET, ansD, SET, curD, GET, ansK, SET, curK, GET, n, SET, curX,
-      BLK, VOID, LOOP, VOID,
-        GET, curD, I32C, 0, LES, BRIF, 1,
-        GET, curD, I32C, 1, SUB, GET, bShift, SHRU, SET, bIdx,
-        GET, bIdx, GET, bShift, SHL, SET, d0, GET, curD, GET, d0, SUB, SET, span,
-        GGET, G.ckptMeta, GET, bIdx, I32C, 4, SHL, ADD, SET, metaPtr,
-        GET, metaPtr, LD32, 0, SET, ckILo, GET, metaPtr, LD32, 4, SET, fLo0, GET, metaPtr, LD32, 8, SET, fHi0, GET, metaPtr, LD32, 12, SET, ckData,
-        GET, curK, GET, span, SUB, SET, baseK0,
-        GET, fLo0, GET, baseK0, GET, fLo0, GET, baseK0, GTS, SEL, SET, rLo0,
-        GET, curK, GET, span, ADD, SET, tmp, GET, fHi0, GET, tmp, GET, fHi0, GET, tmp, LTS, SEL, SET, rHi0,
-        GGET, G.repBuf, I32C, -2, GET, span, I32C, 3, ADD, I32C, 2, SHL, MFILL,
-        GET, rLo0, SET, k,
-        BLK, VOID, LOOP, VOID,
-          GET, k, GET, rHi0, GTS, BRIF, 1,
-          GET, k, GET, baseK0, SUB, I32C, 1, SHRS, SET, col,
-          GET, k, GET, d0, ADD, I32C, 1, SHRS, GET, ckILo, SUB, SET, tmp,
-          LD32_L, ckData, tmp, SET, nx, SA32L, G.repBuf, col, nx,
-          GET, k, I32C, 2, ADD, SET, k, BR, 0,
-        END, END,
-        GET, rLo0, SET, pLo, GET, rHi0, SET, pHi, I32C, 1, SET, s,
-        BLK, VOID, LOOP, VOID,
-          GET, s, GET, span, GTS, BRIF, 1,
-          GET, d0, GET, s, ADD, SET, d,
-          GET, uSub, GET, d, SUB, SET, remD,
-          GET, remD, GET, delta, SUB, SET, lim1, GET, remD, GET, delta, ADD, SET, lim2,
-          GET, curK, GET, span, GET, s, SUB, SUB, SET, wLo,
-          GET, curK, GET, span, GET, s, SUB, ADD, SET, wHi,
-          GET, pLo, I32C, 1, SUB, SET, nx, I32C, 0, GET, lim1, SUB, SET, ny,
-          GET, nx, GET, ny, GET, nx, GET, ny, GTS, SEL, SET, rLo,
-          GET, wLo, GET, rLo, GET, wLo, GET, rLo, GTS, SEL, SET, rLo,
-          GET, pHi, I32C, 1, ADD, SET, nx, GET, lim2, SET, ny,
-          GET, nx, GET, ny, GET, nx, GET, ny, LTS, SEL, SET, rHi,
-          GET, wHi, GET, rHi, GET, wHi, GET, rHi, LTS, SEL, SET, rHi,
-          GET, rLo, GET, d, XOR, I32C, 1, AND, IF, VOID, GET, rLo, I32C, 1, ADD, SET, rLo, END,
-          GET, rHi, GET, d, XOR, I32C, 1, AND, IF, VOID, GET, rHi, I32C, 1, SUB, SET, rHi, END,
-          GET, s, I32C, 1, SUB, GET, stride, MUL, SET, prevRow,
-          GET, s, GET, stride, MUL, SET, curRow,
-          GET, baseK0, GET, s, SUB, SET, shiftBase,
-          GET, rLo, GET, shiftBase, SUB, I32C, 1, SHRS, SET, cILo,
-          GET, rHi, GET, shiftBase, SUB, I32C, 1, SHRS, SET, cIHi,
-          GET, cILo, I32C, 0, GTS, IF, VOID, GET, curRow, GET, cILo, ADD, I32C, 1, SUB, SET, tmp, SA32C, G.repBuf, tmp, -2, END,
-          GET, curRow, GET, cIHi, ADD, I32C, 1, ADD, SET, tmp, SA32C, G.repBuf, tmp, -2,
-          GET, rLo, SET, k,
-          BLK, VOID, LOOP, VOID,
-            GET, k, GET, rHi, GTS, BRIF, 1,
-            GET, k, GET, shiftBase, SUB, I32C, 1, SHRS, SET, col,
-            GET, k, I32C, 1, SUB, TEE, tmp, GET, pLo, GES, GET, tmp, GET, pHi, LES, AND,
-            IF, I32, GET, prevRow, GET, col, ADD, I32C, 1, SUB, SET, tmp, LA32, G.repBuf, tmp, ELSE, I32C, -2, END, SET, xRem,
-            GET, k, I32C, 1, ADD, TEE, tmp, GET, pLo, GES, GET, tmp, GET, pHi, LES, AND,
-            IF, I32, GET, prevRow, GET, col, ADD, SET, tmp, LA32, G.repBuf, tmp, ELSE, I32C, -2, END, SET, xAdd,
-            GET, xRem, I32C, 0, GES, GET, xRem, GET, n, LTS, AND, SET, canRem,
-            GET, xAdd, I32C, 0, GES, GET, xAdd, GET, k, SUB, I32C, 1, SUB, GET, m, LTS, AND, SET, canAdd,
-            GET, canRem, GET, canAdd, EQZ, GET, xRem, I32C, 1, ADD, GET, xAdd, GES, OR, AND,
-            IF, I32, GET, xRem, I32C, 1, ADD, ELSE, GET, canAdd, IF, I32, GET, xAdd, ELSE, I32C, -2, END, END, SET, nx,
-            GET, curRow, GET, col, ADD, SET, tmp,
-            GET, nx, I32C, 0, LTS, IF, VOID, SA32C, G.repBuf, tmp, -2,
-            ELSE,
-              GET, nx, GET, k, SUB, SET, ny,
-              BLK, VOID, LOOP, VOID,
-                LD32_L, aBase, nx, LD32_L, bBase, ny, NE, BRIF, 1,
-                GET, nx, I32C, 1, ADD, SET, nx, GET, ny, I32C, 1, ADD, SET, ny, BR, 0,
-              END, END,
-              SA32L, G.repBuf, tmp, nx,
-            END,
-            GET, k, I32C, 2, ADD, SET, k, BR, 0,
-          END, END,
-          GET, s, GET, span, LTS, GET, usePrune, AND, IF, VOID,
-            BLK, VOID, LOOP, VOID,
-              GET, cILo, GET, cIHi, GTS, BRIF, 1,
-              GET, curRow, GET, cILo, ADD, SET, col, LA32, G.repBuf, col, SET, nx,
-              GET, nx, I32C, 0, GES, IF, VOID,
-                GET, nx, GET, rLo, SUB, SET, ny, ...emitIsValid(rLo), BRIF, 2, SA32C, G.repBuf, col, -2,
-              END,
-              GET, cILo, I32C, 1, ADD, SET, cILo, GET, rLo, I32C, 2, ADD, SET, rLo, BR, 0,
-            END, END,
-            BLK, VOID, LOOP, VOID,
-              GET, cILo, GET, cIHi, GTS, BRIF, 1,
-              GET, curRow, GET, cIHi, ADD, SET, col, LA32, G.repBuf, col, SET, nx,
-              GET, nx, I32C, 0, GES, IF, VOID,
-                GET, nx, GET, rHi, SUB, SET, ny, ...emitIsValid(rHi), BRIF, 2, SA32C, G.repBuf, col, -2,
-              END,
-              GET, cIHi, I32C, 1, SUB, SET, cIHi, GET, rHi, I32C, 2, SUB, SET, rHi, BR, 0,
-            END, END,
-          END,
-          GET, rLo, SET, pLo, GET, rHi, SET, pHi, GET, s, I32C, 1, ADD, SET, s, BR, 0,
-        END, END,
-        GET, curX, SET, traceX, GET, curK, SET, traceK, GET, span, SET, s,
-        BLK, VOID, LOOP, VOID,
-          GET, s, I32C, 1, LTS, BRIF, 1,
-          GET, s, I32C, 1, SUB, GET, stride, MUL, SET, prevRow,
-          GET, baseK0, GET, s, SUB, SET, shiftBase,
-          GET, traceK, GET, shiftBase, SUB, I32C, 1, SHRS, SET, col,
-          GET, col, I32C, 0, GTS, IF, I32, GET, prevRow, GET, col, ADD, I32C, 1, SUB, SET, tmp, LA32, G.repBuf, tmp, ELSE, I32C, -2, END, SET, xRem,
-          GET, prevRow, GET, col, ADD, SET, tmp, LA32, G.repBuf, tmp, SET, xAdd,
-          GET, xRem, I32C, 0, GES, GET, xRem, GET, n, LTS, AND, SET, canRem,
-          GET, xAdd, I32C, 0, GES, GET, xAdd, GET, traceK, SUB, I32C, 1, SUB, GET, m, LTS, AND, SET, canAdd,
-          GET, canRem, GET, canAdd, EQZ, GET, xRem, I32C, 1, ADD, GET, xAdd, GES, OR, AND, IF, VOID,
-            GET, xRem, I32C, 1, ADD, SET, startX, I32C, DELETE, SET, opK, GET, traceK, I32C, 1, SUB, SET, nextK, GET, xRem, SET, prevX,
-          ELSE,
-            GET, xAdd, SET, startX, I32C, INSERT, SET, opK, GET, traceK, I32C, 1, ADD, SET, nextK, GET, xAdd, SET, prevX,
-          END,
-          GET, traceX, GET, startX, SUB, TEE, keep, I32C, 0, GTS, IF, VOID, ...pushOp([I32C, KEEP], [GET, keep]), END,
-          ...pushOp([GET, opK], [I32C, 1]),
-          GET, nextK, SET, traceK, GET, prevX, SET, traceX, GET, s, I32C, 1, SUB, SET, s, BR, 0,
-        END, END,
-        GET, d0, SET, curD, GET, traceK, SET, curK, GET, traceX, SET, curX, BR, 0,
-      END, END,
-      GET, curX, I32C, 0, GTS, IF, VOID, ...pushOp([I32C, KEEP], [GET, curX]), END,
-      GET, opLen, GSET, G.opLen,
-      SA32L, G.A, x1p, sA, SA32L, G.B, y1p, sB,
-    ];
-  });
-
-  // 10. solveMyers() -> loops certified segments backwards, collecting revKind/revCount
-  def(F.solveMyers, [], [], (loc) => {
-    const ptr = loc(), ns = loc(), seg = loc(), n1 = loc(), x0 = loc(), y0 = loc(), x1 = loc(), y1 = loc(), uSub = loc(), useP = loc();
-    return [
-      GGET, G.arenaPtr, SET, ptr,
-      GET, ptr, GSET, G.revKind,
-      GET, ptr, GGET, G.U, I32C, 1, SHL, I32C, 64, ADD, I32C, 7, ADD, I32C, -8, AND, ADD, SET, ptr,
-      GET, ptr, GSET, G.revCount,
-      GET, ptr, GGET, G.U, I32C, 1, SHL, I32C, 64, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.arenaPtr,
-      GET, ptr, I32C, 64, ADD, CALL, F.ensureMem,
-      I32C, 0, GSET, G.opLen,
-      GGET, G.numSegs, SET, ns,
-      GET, ns, I32C, 1, EQ, SET, useP,
-      GET, ns, I32C, 1, SUB, SET, seg,
-      BLK, VOID, LOOP, VOID,
-        GET, seg, I32C, 0, LTS, BRIF, 1,
-        GET, seg, I32C, 1, ADD, SET, n1,
-        LA32, G.segX, seg, SET, x0, LA32, G.segY, seg, SET, y0,
-        LA32, G.segX, n1, SET, x1, LA32, G.segY, n1, SET, y1,
-        LA32, G.segU, seg, SET, uSub,
-        GET, x0, GET, y0, GET, x1, GET, y1, GET, uSub, GET, useP, CALL, F.myersSub,
-        GET, seg, I32C, 1, SUB, SET, seg, BR, 0,
-      END, END,
-    ];
-  });
-
-  // 11. buildChangesAndHunks()
-  def(F.buildChangesAndHunks, [], [], (loc) => {
-    const opLen = loc(), ptr = loc(), idx = loc(), kind = loc(), cnt = loc(), o = loc(), p = loc(), del = loc(), ins = loc();
-    const nc = loc(), last = loc(), nh = loc(), i = loc(), prev = loc(), tmp = loc();
-    return [
-      GGET, G.opLen, SET, opLen, GGET, G.arenaPtr, SET, ptr,
-      GET, ptr, GSET, G.changesO, GET, ptr, GET, opLen, I32C, 4, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.changesP, GET, ptr, GET, opLen, I32C, 4, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.changesD, GET, ptr, GET, opLen, I32C, 4, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.changesI, GET, ptr, GET, opLen, I32C, 4, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.hStart, GET, ptr, GET, opLen, I32C, 4, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.hEnd, GET, ptr, GET, opLen, I32C, 4, ADD, I32C, 2, SHL, ADD, SET, ptr,
-      GET, ptr, GSET, G.arenaPtr, GET, ptr, I32C, 64, ADD, CALL, F.ensureMem,
-      GGET, G.prefix, TEE, o, SET, p, I32C, 0, SET, del, I32C, 0, SET, ins, I32C, 0, SET, nc,
-      GET, opLen, I32C, 1, SUB, SET, idx,
-      BLK, VOID, LOOP, VOID,
-        GET, idx, I32C, 0, LTS, BRIF, 1,
-        LA8, G.revKind, idx, SET, kind, LA32, G.revCount, idx, SET, cnt,
-        GET, kind, I32C, KEEP, EQ, IF, VOID,
-          GET, o, GET, cnt, ADD, SET, o, GET, p, GET, cnt, ADD, SET, p,
-        ELSE,
-          GET, nc, I32C, 1, SUB, SET, last,
-          GET, last, I32C, 0, LTS, IF, I32, I32C, 1,
-          ELSE, LA32, G.changesO, last, LA32, G.changesD, last, ADD, GET, o, NE,
-                LA32, G.changesP, last, LA32, G.changesI, last, ADD, GET, p, NE, OR, END,
-          IF, VOID,
-            SA32L, G.changesO, nc, o, SA32L, G.changesP, nc, p, SA32C, G.changesD, nc, 0, SA32C, G.changesI, nc, 0,
-            GET, nc, SET, last, GET, nc, I32C, 1, ADD, SET, nc,
-          END,
-          GET, kind, I32C, DELETE, EQ, IF, VOID,
-            LA32, G.changesD, last, GET, cnt, ADD, SET, tmp, SA32L, G.changesD, last, tmp,
-            GET, o, GET, cnt, ADD, SET, o, GET, del, GET, cnt, ADD, SET, del,
-          ELSE,
-            LA32, G.changesI, last, GET, cnt, ADD, SET, tmp, SA32L, G.changesI, last, tmp,
-            GET, p, GET, cnt, ADD, SET, p, GET, ins, GET, cnt, ADD, SET, ins,
-          END,
-        END,
-        GET, idx, I32C, 1, SUB, SET, idx, BR, 0,
-      END, END,
-      GET, nc, GSET, G.numChanges, GET, del, GSET, G.deleted, GET, ins, GSET, G.inserted,
-      I32C, 0, SET, nh, I32C, 0, SET, i,
-      BLK, VOID, LOOP, VOID,
-        GET, i, GET, nc, GES, BRIF, 1,
-        GET, nh, I32C, 0, GTS, IF, VOID,
-          GET, nh, I32C, 1, SUB, SET, tmp, LA32, G.hEnd, tmp, SET, prev,
-          LA32, G.changesO, i, LA32, G.changesO, prev, LA32, G.changesD, prev, ADD, SUB, I32C, 6, LES, IF, VOID,
-            SA32L, G.hEnd, tmp, i, GET, i, I32C, 1, ADD, SET, i, BR, 2,
-          END,
-        END,
-        SA32L, G.hStart, nh, i, SA32L, G.hEnd, nh, i,
-        GET, nh, I32C, 1, ADD, SET, nh, GET, i, I32C, 1, ADD, SET, i, BR, 0,
-      END, END,
-      GET, nh, GSET, G.numHunks,
-    ];
-  });
-
-  // 12. writeDec(ptr, val) -> newPtr
-  def(F.writeDec, [I32, I32], [I32], (loc) => {
-    const ptr = 0, val = 1, start = loc(), lo = loc(), hi = loc(), t = loc();
-    return [
-      GET, val, EQZ, IF, VOID, GET, ptr, I32C, 48, ST8, 0, GET, ptr, I32C, 1, ADD, RET, END,
-      GET, ptr, SET, start,
-      BLK, VOID, LOOP, VOID,
-        GET, val, EQZ, BRIF, 1,
-        GET, ptr, GET, val, I32C, 10, REMU, I32C, 48, ADD, ST8, 0,
-        GET, ptr, I32C, 1, ADD, SET, ptr, GET, val, I32C, 10, DIVU, SET, val, BR, 0,
-      END, END,
-      GET, start, SET, lo, GET, ptr, I32C, 1, SUB, SET, hi,
-      BLK, VOID, LOOP, VOID,
-        GET, lo, GET, hi, GEU, BRIF, 1,
-        GET, lo, LD8, 0, SET, t, GET, lo, GET, hi, LD8, 0, ST8, 0, GET, hi, GET, t, ST8, 0,
-        GET, lo, I32C, 1, ADD, SET, lo, GET, hi, I32C, 1, SUB, SET, hi, BR, 0,
-      END, END,
-      GET, ptr,
-    ];
-  });
-
-  // 13. pushLineOut(out, base, s, e, opB) -> newOut
-  def(F.pushLineOut, [I32, I32, I32, I32, I32], [I32], (loc) => {
-    const out = 0, base = 1, s = 2, e = 3, opB = 4, len = loc();
-    return [
-      GET, out, GET, opB, ST8, 0, GET, out, I32C, 1, ADD, SET, out,
-      GET, e, GET, s, SUB, SET, len,
-      GET, out, GET, base, GET, s, ADD, GET, len, MCOPY,
-      GET, out, GET, len, ADD, SET, out,
-      GET, base, GET, e, ADD, I32C, 1, SUB, LD8, 0, I32C, 10, NE, IF, VOID,
-        GET, out, I32C, 10, ST8, 0, GET, out, I32C, 37, ST8, 1, GET, out, I32C, 10, ST8, 2,
-        GET, out, I32C, 3, ADD, SET, out,
-      END,
-      GET, out,
-    ];
-  });
-
-  // 14. buildPatch()
-  def(F.buildPatch, [], [], (loc) => {
-    const outBase = loc(), ptr = loc(), totalOld = loc(), totalNew = loc(), prefix = loc(), suffix = loc(), n = loc(), m = loc(), nh = loc();
-    const oBase = loc(), nBase = loc(), oStart = loc(), oEnd = loc(), oLen = loc(), preNeed = loc(), sufNeed = loc(), preArr = loc(), sufArr = loc();
-    const curPos = loc(), i = loc(), hi = loc(), fi = loc(), li = loc(), firstO = loc(), firstP = loc(), lastO = loc(), lastP = loc(), lastD = loc(), lastI = loc();
-    const oldStart = loc(), newStart = loc(), remAfter = loc(), after = loc(), oldEnd = loc(), newEnd = loc();
-    const at = loc(), ci = loc(), co = loc(), cp = loc(), cd = loc(), cins = loc(), mi = loc(), maxBytes = loc(), oB = loc(), nB = loc(), bp = loc();
-
-    const emitStr = (str) => {
-      const a = [];
-      for (let k = 0; k < str.length; k++) a.push(GET, ptr, I32C, str.charCodeAt(k), ST8, k);
-      a.push(GET, ptr, I32C, str.length, ADD, SET, ptr);
-      return a;
-    };
-    const emitPushOld = (giL, opByte) => {
-      const s = loc(), e = loc(), off = loc();
-      return [
-        GET, giL, GET, prefix, GES, GET, giL, GET, prefix, GET, n, ADD, LTS, AND, IF, VOID,
-          GET, giL, GET, prefix, SUB, SET, off,
-          GET, oB, GET, off, I32C, 2, SHL, ADD, TEE, bp, LD32, 0, SET, s, GET, bp, LD32, 4, SET, e,
-        ELSE, GET, giL, GET, prefix, LTS, IF, VOID,
-          GET, giL, GET, prefix, GET, preNeed, SUB, SUB, SET, off,
-          GET, preArr, GET, off, I32C, 2, SHL, ADD, TEE, off, LD32, 0, SET, s, GET, off, LD32, 4, SET, e,
-        ELSE,
-          GET, giL, GET, prefix, GET, n, ADD, SUB, SET, off,
-          GET, sufArr, GET, off, I32C, 2, SHL, ADD, TEE, off, LD32, 0, SET, s, GET, off, LD32, 4, SET, e,
-        END, END,
-        GET, ptr, GET, oBase, GET, s, GET, e, I32C, opByte, CALL, F.pushLineOut, SET, ptr,
-      ];
-    };
-
-    return [
-      GGET, G.prefix, SET, prefix, GGET, G.suffix, SET, suffix, GGET, G.n, SET, n, GGET, G.m, SET, m, GGET, G.numHunks, SET, nh,
-      GET, prefix, GET, n, ADD, GET, suffix, ADD, SET, totalOld,
-      GET, prefix, GET, m, ADD, GET, suffix, ADD, SET, totalNew,
-      GGET, G.oBase, SET, oBase, GGET, G.nBase, SET, nBase, GGET, G.oStart, SET, oStart, GGET, G.oEnd, SET, oEnd, GGET, G.oLen, SET, oLen,
-      GGET, G.oBounds, SET, oB, GGET, G.nBounds, SET, nB,
-      GGET, G.arenaPtr, SET, ptr,
-      GET, ptr, SET, preArr, GET, ptr, I32C, 16, ADD, SET, ptr,
-      GET, ptr, SET, sufArr, GET, ptr, I32C, 16, ADD, SET, ptr,
-      GET, ptr, TEE, outBase, GSET, G.outBase,
-      GET, oLen, GGET, G.nLen, ADD, GET, totalOld, GET, totalNew, ADD, I32C, 2, SHL, ADD, GET, nh, I32C, 6, SHL, ADD, I32C, 512, ADD, SET, maxBytes,
-      GET, outBase, GET, maxBytes, ADD, CALL, F.ensureMem,
-      GET, outBase, SET, ptr,
-      ...emitStr('makefun-diff/1 old='), GET, ptr, GET, totalOld, CALL, F.writeDec, SET, ptr,
-      ...emitStr(' new='), GET, ptr, GET, totalNew, CALL, F.writeDec, SET, ptr,
-      ...emitStr(' hunks='), GET, ptr, GET, nh, CALL, F.writeDec, SET, ptr,
-      ...emitStr(' deleted='), GET, ptr, GGET, G.deleted, CALL, F.writeDec, SET, ptr,
-      ...emitStr(' inserted='), GET, ptr, GGET, G.inserted, CALL, F.writeDec, SET, ptr,
-      GET, ptr, I32C, 10, ST8, 0, GET, ptr, I32C, 1, ADD, SET, ptr,
-      GET, nh, EQZ, IF, VOID, GET, ptr, GSET, G.outEnd, RET, END,
-      I32C, 0, SET, preNeed,
-      GGET, G.changesO, LD32, 0, GET, prefix, I32C, 3, ADD, LTS, GET, prefix, I32C, 0, GTS, AND, IF, VOID,
-        GET, prefix, I32C, 3, GET, prefix, I32C, 3, LTS, SEL, SET, preNeed,
-        GET, oStart, SET, curPos,
-        GET, preArr, GET, preNeed, I32C, 2, SHL, ADD, GET, curPos, ST32, 0,
-        GET, preNeed, I32C, 1, SUB, SET, i,
-        BLK, VOID, LOOP, VOID,
-          GET, i, I32C, 0, LTS, BRIF, 1,
-          GET, curPos, GET, oBase, GET, curPos, ADD, I32C, 1, SUB, LD8, 0, I32C, 10, EQ, IF, I32, I32C, 2, ELSE, I32C, 1, END, SUB, SET, curPos,
-          BLK, VOID, LOOP, VOID,
-            GET, curPos, I32C, 0, LTS, BRIF, 1,
-            GET, oBase, GET, curPos, ADD, LD8, 0, I32C, 10, EQ, BRIF, 1,
-            GET, curPos, I32C, 1, SUB, SET, curPos, BR, 0,
-          END, END,
-          GET, curPos, I32C, 1, ADD, SET, curPos,
-          GET, preArr, GET, i, I32C, 2, SHL, ADD, GET, curPos, ST32, 0,
-          GET, i, I32C, 1, SUB, SET, i, BR, 0,
-        END, END,
-      END,
-      I32C, 0, SET, sufNeed,
-      GET, suffix, I32C, 0, GTS, IF, VOID,
-        GGET, G.hEnd, GET, nh, I32C, 1, SUB, I32C, 2, SHL, ADD, LD32, 0, SET, li,
-        LA32, G.changesO, li, LA32, G.changesD, li, ADD, I32C, 3, ADD, GET, prefix, GET, n, ADD, GTS, IF, VOID,
-          GET, suffix, I32C, 3, GET, suffix, I32C, 3, LTS, SEL, SET, sufNeed,
-          GET, oEnd, SET, curPos, GET, sufArr, GET, curPos, ST32, 0, I32C, 1, SET, i,
-          BLK, VOID, LOOP, VOID,
-            GET, i, GET, sufNeed, GTS, BRIF, 1,
-            BLK, VOID, LOOP, VOID,
-              GET, curPos, GET, oLen, GEU, BRIF, 1,
-              GET, oBase, GET, curPos, ADD, LD8, 0, I32C, 10, EQ, IF, VOID, GET, curPos, I32C, 1, ADD, SET, curPos, BR, 2, END,
-              GET, curPos, I32C, 1, ADD, SET, curPos, BR, 0,
-            END, END,
-            GET, sufArr, GET, i, I32C, 2, SHL, ADD, GET, curPos, ST32, 0,
-            GET, i, I32C, 1, ADD, SET, i, BR, 0,
-          END, END,
-        END,
-      END,
-      I32C, 0, SET, hi,
-      BLK, VOID, LOOP, VOID,
-        GET, hi, GET, nh, GES, BRIF, 1,
-        LA32, G.hStart, hi, SET, fi, LA32, G.hEnd, hi, SET, li,
-        LA32, G.changesO, fi, SET, firstO, LA32, G.changesP, fi, SET, firstP,
-        LA32, G.changesO, li, SET, lastO, LA32, G.changesP, li, SET, lastP,
-        LA32, G.changesD, li, SET, lastD, LA32, G.changesI, li, SET, lastI,
-        GET, firstO, I32C, 3, GTS, IF, I32, GET, firstO, I32C, 3, SUB, ELSE, I32C, 0, END, SET, oldStart,
-        GET, firstP, GET, firstO, GET, oldStart, SUB, SUB, SET, newStart,
-        GET, totalOld, GET, lastO, GET, lastD, ADD, SUB, SET, remAfter,
-        GET, remAfter, I32C, 3, GET, remAfter, I32C, 3, LTS, SEL, SET, after,
-        GET, lastO, GET, lastD, ADD, GET, after, ADD, SET, oldEnd,
-        GET, lastP, GET, lastI, ADD, GET, after, ADD, SET, newEnd,
-        ...emitStr('@ '), GET, ptr, GET, oldStart, I32C, 1, ADD, CALL, F.writeDec, SET, ptr,
-        GET, ptr, I32C, 32, ST8, 0, GET, ptr, I32C, 1, ADD, SET, ptr,
-        GET, ptr, GET, oldEnd, GET, oldStart, SUB, CALL, F.writeDec, SET, ptr,
-        GET, ptr, I32C, 32, ST8, 0, GET, ptr, I32C, 1, ADD, SET, ptr,
-        GET, ptr, GET, newStart, I32C, 1, ADD, CALL, F.writeDec, SET, ptr,
-        GET, ptr, I32C, 32, ST8, 0, GET, ptr, I32C, 1, ADD, SET, ptr,
-        GET, ptr, GET, newEnd, GET, newStart, SUB, CALL, F.writeDec, SET, ptr,
-        GET, ptr, I32C, 10, ST8, 0, GET, ptr, I32C, 1, ADD, SET, ptr,
-        GET, oldStart, SET, at, GET, fi, SET, ci,
-        BLK, VOID, LOOP, VOID,
-          GET, ci, GET, li, GTS, BRIF, 1,
-          LA32, G.changesO, ci, SET, co, LA32, G.changesP, ci, SET, cp,
-          LA32, G.changesD, ci, SET, cd, LA32, G.changesI, ci, SET, cins,
-          BLK, VOID, LOOP, VOID,
-            GET, at, GET, co, GES, BRIF, 1, ...emitPushOld(at, 61), GET, at, I32C, 1, ADD, SET, at, BR, 0,
-          END, END,
-          I32C, 0, SET, i,
-          BLK, VOID, LOOP, VOID,
-            GET, i, GET, cd, GES, BRIF, 1, GET, co, GET, i, ADD, SET, at, ...emitPushOld(at, 45), GET, i, I32C, 1, ADD, SET, i, BR, 0,
-          END, END,
-          I32C, 0, SET, i,
-          BLK, VOID, LOOP, VOID,
-            GET, i, GET, cins, GES, BRIF, 1,
-            GET, cp, GET, i, ADD, GET, prefix, SUB, SET, mi,
-            GET, ptr, GET, nBase, GET, nB, GET, mi, I32C, 2, SHL, ADD, TEE, bp, LD32, 0, GET, bp, LD32, 4, I32C, 43, CALL, F.pushLineOut, SET, ptr,
-            GET, i, I32C, 1, ADD, SET, i, BR, 0,
-          END, END,
-          GET, co, GET, cd, ADD, SET, at, GET, ci, I32C, 1, ADD, SET, ci, BR, 0,
-        END, END,
-        BLK, VOID, LOOP, VOID,
-          GET, at, GET, oldEnd, GES, BRIF, 1, ...emitPushOld(at, 61), GET, at, I32C, 1, ADD, SET, at, BR, 0,
-        END, END,
-        GET, hi, I32C, 1, ADD, SET, hi, BR, 0,
-      END, END,
-      GET, ptr, GSET, G.outEnd,
-    ];
-  });
-
-  // 15. solveAscii() -> outLen
-  def(F.solveAscii, [], [I32], () => [
-    CALL, F.trimPrefixSuffix,
-    GGET, G.oStart, GGET, G.oEnd, EQ, GGET, G.nStart, GGET, G.nEnd, EQ, AND, IF, VOID,
-      I32C, 0, GSET, G.n, I32C, 0, GSET, G.m, I32C, 0, GSET, G.numHunks, I32C, 0, GSET, G.deleted, I32C, 0, GSET, G.inserted,
-      GGET, G.arenaBase, GSET, G.arenaPtr, CALL, F.buildPatch, GGET, G.outEnd, GGET, G.outBase, SUB, RET,
-    END,
-    CALL, F.scanLines,
-    GGET, G.n, EQZ, GGET, G.m, EQZ, OR, IF, VOID,
-      GGET, G.changesO, GGET, G.prefix, ST32, 0, GGET, G.changesP, GGET, G.prefix, ST32, 0,
-      GGET, G.changesD, GGET, G.n, ST32, 0, GGET, G.changesI, GGET, G.m, ST32, 0,
-      GGET, G.hStart, I32C, 0, ST32, 0, GGET, G.hEnd, I32C, 0, ST32, 0,
-      I32C, 1, GSET, G.numChanges, I32C, 1, GSET, G.numHunks,
-      GGET, G.n, GSET, G.deleted, GGET, G.m, GSET, G.inserted,
-      CALL, F.buildPatch, GGET, G.outEnd, GGET, G.outBase, SUB, RET,
-    END,
-    CALL, F.internLines,
-    CALL, F.buildBoundsAndUB, DROP,
-    CALL, F.solveMyers,
-    CALL, F.buildChangesAndHunks,
-    CALL, F.buildPatch,
-    GGET, G.outEnd, GGET, G.outBase, SUB,
-  ]);
-
-  def(F.getOutBase, [], [I32], () => [GGET, G.outBase]);
-  def(F.getBatchOutBase, [], [I32], () => [GGET, G.batchOutBase]);
-
-  // 16. skipWs(pos, end) -> pos
-  def(F.skipWs, [I32, I32], [I32], (loc) => {
-    const pos = 0, end = 1, b = loc();
-    return [
-      BLK, VOID, LOOP, VOID,
-        GET, pos, GET, end, GEU, BRIF, 1,
-        GET, pos, LD8, 0, TEE, b,
-        I32C, 32, EQ, GET, b, I32C, 9, EQ, OR, GET, b, I32C, 10, EQ, OR, GET, b, I32C, 13, EQ, OR, EQZ, BRIF, 1,
-        GET, pos, I32C, 1, ADD, SET, pos, BR, 0,
-      END, END,
-      GET, pos,
-    ];
-  });
-
-  // 17. skipJsonStr(pos, end) -> newPos or -1
-  def(F.skipJsonStr, [I32, I32], [I32], (loc) => {
-    const pos = 0, end = 1, b = loc();
-    return [
-      GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-      GET, pos, LD8, 0, I32C, 34, NE, IF, VOID, I32C, -1, RET, END,
-      GET, pos, I32C, 1, ADD, SET, pos,
-      BLK, VOID, LOOP, VOID,
-        GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-        GET, pos, LD8, 0, SET, b,
-        GET, b, I32C, 34, EQ, IF, VOID, GET, pos, I32C, 1, ADD, RET, END,
-        GET, b, I32C, 92, EQ, IF, VOID,
-          GET, pos, I32C, 1, ADD, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-          GET, pos, I32C, 2, ADD, SET, pos, BR, 1,
-        END,
-        GET, b, I32C, 32, LTU, GET, b, I32C, 127, GTU, OR, IF, VOID, I32C, -1, RET, END,
-        GET, pos, I32C, 1, ADD, SET, pos, BR, 0,
-      END, END,
-      I32C, -1,
-    ];
-  });
-
-  // 18. unescapeJsonStr(src, end, dstBase) -> len or -1 (SIMD128, \n & \r checked first!)
-  def(F.unescapeJsonStr, [I32, I32, I32], [I32], (loc) => {
-    const src = 0, end = 1, dstBase = 2;
-    const dst = loc(), end16 = loc(), mask = loc(), k = loc(), b = loc(), esc = loc(), h1 = loc(), h2 = loc();
-    const q16 = loc(V128), bs16 = loc(V128), sp16 = loc(V128), v = loc(V128);
-    const emitHex = (chL, outL) => [
-      GET, chL, I32C, 48, SUB, TEE, outL, I32C, 9, LEU, IF, VOID,
-      ELSE, GET, chL, I32C, 32, OR, I32C, 87, SUB, TEE, outL, I32C, 10, LTU, GET, outL, I32C, 15, GTU, OR, IF, VOID, I32C, -1, RET, END, END,
-    ];
-    const emitHandleEsc = () => [
-      GET, src, I32C, 1, ADD, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-      GET, src, I32C, 1, ADD, LD8, 0, SET, esc,
-      GET, esc, I32C, 110, EQ, IF, VOID, GET, dst, I32C, 10, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 114, EQ, IF, VOID, GET, dst, I32C, 13, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 34, EQ, IF, VOID, GET, dst, I32C, 34, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 92, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 116, EQ, IF, VOID, GET, dst, I32C, 9, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 98, EQ, IF, VOID, GET, dst, I32C, 8, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 102, EQ, IF, VOID, GET, dst, I32C, 12, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 47, EQ, IF, VOID, GET, dst, I32C, 47, ST8, 0, GET, src, I32C, 2, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, GET, esc, I32C, 117, EQ, IF, VOID,
-        GET, src, I32C, 5, ADD, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-        GET, src, LD8, 2, I32C, 48, NE, GET, src, LD8, 3, I32C, 48, NE, OR, IF, VOID, I32C, -1, RET, END,
-        GET, src, LD8, 4, SET, b, ...emitHex(b, h1),
-        GET, h1, I32C, 7, GTU, IF, VOID, I32C, -1, RET, END,
-        GET, src, LD8, 5, SET, b, ...emitHex(b, h2),
-        GET, dst, GET, h1, I32C, 4, SHL, GET, h2, OR, ST8, 0,
-        GET, src, I32C, 6, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst,
-      ELSE, I32C, -1, RET, END, END, END, END, END, END, END, END, END,
-    ];
-    return [
-      GET, src, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-      GET, src, LD8, 0, I32C, 34, NE, IF, VOID, I32C, -1, RET, END,
-      GET, src, I32C, 1, ADD, SET, src, GET, dstBase, SET, dst, GET, end, I32C, 16, SUB, SET, end16,
-      I32C, 34, VSPLAT8, SET, q16, I32C, 92, VSPLAT8, SET, bs16, I32C, 32, VSPLAT8, SET, sp16,
-      BLK, VOID, LOOP, VOID,
-        GET, src, GET, end16, GTS, BRIF, 1,
-        GET, src, VLD, 0, TEE, v,
-        GET, v, GET, q16, VEQ8, GET, v, GET, bs16, VEQ8, VOR, GET, v, GET, sp16, VLTS8, VOR,
-        VBM8, TEE, mask, EQZ, IF, VOID,
-          GET, dst, GET, v, VST, 0,
-          GET, src, I32C, 16, ADD, SET, src, GET, dst, I32C, 16, ADD, SET, dst, BR, 1,
-        END,
-        GET, mask, CTZ, TEE, k, IF, VOID,
-          GET, dst, GET, v, VST, 0,
-          GET, src, GET, k, ADD, SET, src, GET, dst, GET, k, ADD, SET, dst,
-        END,
-        GET, src, LD8, 0, SET, b,
-        GET, b, I32C, 34, EQ, IF, VOID, GET, src, I32C, 1, ADD, GSET, G.jsonCur, GET, dst, GET, dstBase, SUB, RET, END,
-        GET, b, I32C, 92, NE, IF, VOID, I32C, -1, RET, END,
-        ...emitHandleEsc(), BR, 0,
-      END, END,
-      BLK, VOID, LOOP, VOID,
-        GET, src, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-        GET, src, LD8, 0, SET, b,
-        GET, b, I32C, 34, EQ, IF, VOID, GET, src, I32C, 1, ADD, GSET, G.jsonCur, GET, dst, GET, dstBase, SUB, RET, END,
-        GET, b, I32C, 92, EQ, IF, VOID, ...emitHandleEsc(), BR, 1, END,
-        GET, b, I32C, 32, LTU, GET, b, I32C, 127, GTU, OR, IF, VOID, I32C, -1, RET, END,
-        GET, dst, GET, b, ST8, 0, GET, src, I32C, 1, ADD, SET, src, GET, dst, I32C, 1, ADD, SET, dst, BR, 0,
-      END, END,
-      I32C, -1,
-    ];
-  });
-
-  // 19. escapeJsonOut(src, len, dst) -> newDst (SIMD128)
-  def(F.escapeJsonOut, [I32, I32, I32], [I32], (loc) => {
-    const src = 0, len = 1, dst = 2, end = loc(), end16 = loc(), mask = loc(), k = loc(), b = loc(), h1 = loc(), h2 = loc();
-    const q16 = loc(V128), bs16 = loc(V128), sp16 = loc(V128), v = loc(V128);
-    const emitEsc = () => [
-      GET, b, I32C, 10, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 110, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE, GET, b, I32C, 34, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 34, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE, GET, b, I32C, 92, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 92, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE, GET, b, I32C, 13, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 114, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE, GET, b, I32C, 9, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 116, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE, GET, b, I32C, 8, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 98, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE, GET, b, I32C, 12, EQ, IF, VOID, GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 102, ST8, 1, GET, dst, I32C, 2, ADD, SET, dst,
-      ELSE,
-        GET, dst, I32C, 92, ST8, 0, GET, dst, I32C, 117, ST8, 1, GET, dst, I32C, 48, ST8, 2, GET, dst, I32C, 48, ST8, 3,
-        GET, b, I32C, 4, SHRU, I32C, 48, ADD, SET, h1,
-        GET, b, I32C, 15, AND, TEE, h2, I32C, 10, LTU, IF, I32, GET, h2, I32C, 48, ADD, ELSE, GET, h2, I32C, 87, ADD, END, SET, h2,
-        GET, dst, GET, h1, ST8, 4, GET, dst, GET, h2, ST8, 5, GET, dst, I32C, 6, ADD, SET, dst,
-      END, END, END, END, END, END, END,
-    ];
-    return [
-      GET, dst, I32C, 34, ST8, 0, GET, dst, I32C, 1, ADD, SET, dst,
-      GET, src, GET, len, ADD, TEE, end, I32C, 16, SUB, SET, end16,
-      I32C, 34, VSPLAT8, SET, q16, I32C, 92, VSPLAT8, SET, bs16, I32C, 32, VSPLAT8, SET, sp16,
-      BLK, VOID, LOOP, VOID,
-        GET, src, GET, end16, GTS, BRIF, 1,
-        GET, src, VLD, 0, TEE, v,
-        GET, v, GET, q16, VEQ8, GET, v, GET, bs16, VEQ8, VOR, GET, v, GET, sp16, VLTS8, VOR,
-        VBM8, TEE, mask, EQZ, IF, VOID,
-          GET, dst, GET, v, VST, 0,
-          GET, src, I32C, 16, ADD, SET, src, GET, dst, I32C, 16, ADD, SET, dst, BR, 1,
-        END,
-        GET, mask, CTZ, TEE, k, IF, VOID,
-          GET, dst, GET, v, VST, 0,
-          GET, src, GET, k, ADD, SET, src, GET, dst, GET, k, ADD, SET, dst,
-        END,
-        GET, src, LD8, 0, SET, b, GET, src, I32C, 1, ADD, SET, src,
-        ...emitEsc(), BR, 0,
-      END, END,
-      BLK, VOID, LOOP, VOID,
-        GET, src, GET, end, GEU, BRIF, 1,
-        GET, src, LD8, 0, SET, b, GET, src, I32C, 1, ADD, SET, src,
-        GET, b, I32C, 34, EQ, GET, b, I32C, 92, EQ, OR, GET, b, I32C, 32, LTU, OR, IF, VOID,
-          ...emitEsc(),
-        ELSE, GET, dst, GET, b, ST8, 0, GET, dst, I32C, 1, ADD, SET, dst, END,
-        BR, 0,
-      END, END,
-      GET, dst, I32C, 34, ST8, 0, GET, dst, I32C, 1, ADD,
-    ];
-  });
-
-  // 19b. expectByte(pos, end, ch) -> newPos or -1
-  def(F.expectByte, [I32, I32, I32], [I32], () => [
-    GET, 0, GET, 1, GEU, IF, VOID, I32C, -1, RET, END,
-    GET, 0, LD8, 0, GET, 2, NE, IF, VOID, I32C, -1, RET, END,
-    GET, 0, I32C, 1, ADD, GET, 1, CALL, F.skipWs,
-  ]);
-
-  // 20. solveBatchJson() -> batchOutLen or -1
-  def(F.solveBatchJson, [], [I32], (loc) => {
-    const end = loc(), pos = loc(), batchOutBase = loc(), batchPtr = loc(), caseIdx = loc();
-    const seenInput = loc(), oLen = loc(), nLen = loc(), oBase = loc(), nBase = loc(), buf1 = loc(), len1 = loc();
-    const outLen = loc(), outBase = loc(), outEnd = loc(), tmpDst = loc(), tmpEnd = loc(), escLen = loc(), b = loc(), isOld = loc(), ab = loc();
-    const expectByte = (ch) => [
-      GET, pos, GET, end, I32C, ch, CALL, F.expectByte, TEE, pos, I32C, 0, LTS, IF, VOID, I32C, -1, RET, END,
-    ];
-    return [
-      GGET, G.jsonLen, SET, end,
-      I32C, 0, GET, end, CALL, F.skipWs, SET, pos,
-      ...expectByte(91),
-      GET, end, I32C, 31, ADD, I32C, -16, AND, TEE, batchOutBase, GSET, G.batchOutBase,
-      GET, batchOutBase, I32C, 1024, ADD, CALL, F.ensureMem,
-      GET, batchOutBase, SET, batchPtr, GET, batchPtr, I32C, 91, ST8, 0, GET, batchPtr, I32C, 1, ADD, SET, batchPtr,
-      GET, pos, GET, end, LTU, IF, VOID,
-        GET, pos, LD8, 0, I32C, 93, EQ, IF, VOID,
-          GET, pos, I32C, 1, ADD, GET, end, CALL, F.skipWs, GET, end, NE, IF, VOID, I32C, -1, RET, END,
-          GET, batchPtr, I32C, 93, ST8, 0, GET, batchPtr, I32C, 1, ADD, GET, batchOutBase, SUB, RET,
-        END,
-      END,
-      I32C, 0, SET, caseIdx,
-      BLK, VOID, LOOP, VOID,
-        GET, caseIdx, I32C, 0, GTS, IF, VOID,
-          GET, batchPtr, I32C, 16, ADD, CALL, F.ensureMem,
-          GET, batchPtr, I32C, 44, ST8, 0, GET, batchPtr, I32C, 1, ADD, SET, batchPtr,
-        END,
-        ...expectByte(123),
-        I32C, 0, SET, seenInput, I32C, -1, SET, oLen, I32C, -1, SET, nLen,
-        BLK, VOID, LOOP, VOID,
-          GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-          GET, pos, LD8, 0, I32C, 125, EQ, BRIF, 1,
-          GET, pos, I32C, 7, ADD, GET, end, LEU, IF, I32,
-            GET, pos, LD32U, 0, I32C, 0x706e6922, EQ, GET, pos, LD32U, 3, I32C, 0x22747570, EQ, AND,
-          ELSE, I32C, 0, END, IF, VOID,
-            GET, seenInput, IF, VOID, I32C, -1, RET, END, I32C, 1, SET, seenInput,
-            GET, pos, I32C, 7, ADD, GET, end, CALL, F.skipWs, SET, pos,
-            ...expectByte(58), ...expectByte(123),
-            GET, batchPtr, I32C, 31, ADD, I32C, -16, AND, SET, buf1, I32C, 0, SET, len1,
-            BLK, VOID, LOOP, VOID,
-              GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-              GET, pos, LD8, 0, I32C, 125, EQ, BRIF, 1,
-              GET, pos, I32C, 5, ADD, GET, end, GTU, IF, VOID, I32C, -1, RET, END,
-              GET, pos, LD8, 4, I32C, 34, NE, IF, VOID, I32C, -1, RET, END,
-              GET, pos, LD32U, 0, I32C, 0x646c6f22, EQ, IF, VOID, I32C, 1, SET, isOld,
-              ELSE, GET, pos, LD32U, 0, I32C, 0x77656e22, EQ, IF, VOID, I32C, 0, SET, isOld,
-              ELSE, I32C, -1, RET, END, END,
-              GET, isOld, IF, VOID, GET, oLen, I32C, 0, GES, IF, VOID, I32C, -1, RET, END,
-              ELSE, GET, nLen, I32C, 0, GES, IF, VOID, I32C, -1, RET, END, END,
-              GET, pos, I32C, 5, ADD, GET, end, CALL, F.skipWs, SET, pos,
-              ...expectByte(58),
-              GET, oLen, I32C, 0, LTS, GET, nLen, I32C, 0, LTS, AND, IF, VOID,
-                GET, buf1, GET, end, GET, pos, SUB, ADD, I32C, 64, ADD, CALL, F.ensureMem,
-                GET, pos, GET, end, GET, buf1, CALL, F.unescapeJsonStr, TEE, len1, I32C, 0, LTS, IF, VOID, I32C, -1, RET, END,
-                GET, isOld, IF, VOID, GET, buf1, SET, oBase, GET, len1, SET, oLen,
-                ELSE, GET, buf1, SET, nBase, GET, len1, SET, nLen, END,
-              ELSE,
-                GET, buf1, GET, len1, ADD, I32C, 31, ADD, I32C, -16, AND, SET, ab,
-                GET, ab, GET, end, GET, pos, SUB, ADD, I32C, 64, ADD, CALL, F.ensureMem,
-                GET, pos, GET, end, GET, ab, CALL, F.unescapeJsonStr, TEE, tmpEnd, I32C, 0, LTS, IF, VOID, I32C, -1, RET, END,
-                GET, isOld, IF, VOID, GET, ab, SET, oBase, GET, tmpEnd, SET, oLen,
-                ELSE, GET, ab, SET, nBase, GET, tmpEnd, SET, nLen, END,
-              END,
-              GGET, G.jsonCur, GET, end, CALL, F.skipWs, SET, pos,
-              GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-              GET, pos, LD8, 0, I32C, 44, EQ, IF, VOID, GET, pos, I32C, 1, ADD, GET, end, CALL, F.skipWs, SET, pos, BR, 1, END,
-              BR, 1,
-            END, END,
-            ...expectByte(125),
-          ELSE,
-            GET, pos, I32C, 4, ADD, GET, end, LEU, IF, I32, GET, pos, LD32U, 0, I32C, 0x22646922, EQ, ELSE, I32C, 0, END, IF, VOID,
-              GET, pos, I32C, 4, ADD, GET, end, CALL, F.skipWs, SET, pos,
-            ELSE, GET, pos, I32C, 7, ADD, GET, end, LEU, IF, I32, GET, pos, LD32U, 0, I32C, 0x6f726722, EQ, GET, pos, LD32U, 3, I32C, 0x2270756f, EQ, AND, ELSE, I32C, 0, END, IF, VOID,
-              GET, pos, I32C, 7, ADD, GET, end, CALL, F.skipWs, SET, pos,
-            ELSE, I32C, -1, RET, END, END,
-            ...expectByte(58),
-            GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-            GET, pos, LD8, 0, I32C, 34, EQ, IF, VOID,
-              GET, pos, GET, end, CALL, F.skipJsonStr, TEE, pos, I32C, 0, LTS, IF, VOID, I32C, -1, RET, END,
-            ELSE,
-              GET, pos, LD8, 0, I32C, 45, EQ, IF, VOID, GET, pos, I32C, 1, ADD, SET, pos, END,
-              GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-              GET, pos, LD8, 0, TEE, b, I32C, 48, LTU, GET, b, I32C, 57, GTU, OR, IF, VOID, I32C, -1, RET, END,
-              BLK, VOID, LOOP, VOID,
-                GET, pos, GET, end, GEU, BRIF, 1,
-                GET, pos, LD8, 0, TEE, b, I32C, 48, LTU, GET, b, I32C, 57, GTU, OR, BRIF, 1,
-                GET, pos, I32C, 1, ADD, SET, pos, BR, 0,
-              END, END,
-            END,
-            GET, pos, GET, end, CALL, F.skipWs, SET, pos,
-          END,
-          GET, pos, GET, end, GEU, IF, VOID, I32C, -1, RET, END,
-          GET, pos, LD8, 0, I32C, 44, EQ, IF, VOID, GET, pos, I32C, 1, ADD, GET, end, CALL, F.skipWs, SET, pos, BR, 1, END,
-          BR, 1,
-        END, END,
-        ...expectByte(125),
-        GET, seenInput, EQZ, GET, oLen, I32C, 0, LTS, OR, GET, nLen, I32C, 0, LTS, OR, IF, VOID, I32C, -1, RET, END,
-        GET, oBase, GSET, G.oBase, GET, oLen, GSET, G.oLen, GET, nBase, GSET, G.nBase, GET, nLen, GSET, G.nLen,
-        GET, oBase, GET, oLen, ADD, TEE, ab, GET, nBase, GET, nLen, ADD, TEE, tmpDst,
-        GET, ab, GET, tmpDst, GTU, SEL, I32C, 31, ADD, I32C, -16, AND, GSET, G.arenaBase,
-        CALL, F.solveAscii, TEE, outLen, I32C, 0, LTS, IF, VOID, I32C, -1, RET, END,
-        GGET, G.outBase, SET, outBase, GGET, G.outEnd, SET, outEnd,
-        GET, batchPtr, GET, outLen, I32C, 6, MUL, ADD, I32C, 64, ADD, GET, outBase, LEU, IF, VOID,
-          GET, outBase, GET, outLen, GET, batchPtr, CALL, F.escapeJsonOut, SET, batchPtr,
-        ELSE,
-          GET, outEnd, I32C, 31, ADD, I32C, -16, AND, SET, tmpDst,
-          GET, tmpDst, GET, outLen, I32C, 6, MUL, ADD, I32C, 64, ADD, CALL, F.ensureMem,
-          GET, outBase, GET, outLen, GET, tmpDst, CALL, F.escapeJsonOut, SET, tmpEnd,
-          GET, tmpEnd, GET, tmpDst, SUB, SET, escLen,
-          GET, batchPtr, GET, tmpDst, GET, escLen, MCOPY,
-          GET, batchPtr, GET, escLen, ADD, SET, batchPtr,
-        END,
-        GET, caseIdx, I32C, 1, ADD, SET, caseIdx,
-        GET, pos, GET, end, LTU, IF, VOID,
-          GET, pos, LD8, 0, I32C, 44, EQ, IF, VOID, GET, pos, I32C, 1, ADD, GET, end, CALL, F.skipWs, SET, pos, BR, 2, END,
-        END,
-        BR, 1,
-      END, END,
-      ...expectByte(93),
-      GET, pos, GET, end, NE, IF, VOID, I32C, -1, RET, END,
-      GET, batchPtr, I32C, 16, ADD, CALL, F.ensureMem,
-      GET, batchPtr, I32C, 93, ST8, 0, GET, batchPtr, I32C, 1, ADD, GET, batchOutBase, SUB,
-    ];
-  });
-
-  // Encode WASM module directly into a single Uint8Array
-  const out = new Uint8Array(32768);
-  let p = 0;
-  out[p++] = 0x00; out[p++] = 0x61; out[p++] = 0x73; out[p++] = 0x6d;
-  out[p++] = 0x01; out[p++] = 0x00; out[p++] = 0x00; out[p++] = 0x00;
-  const beginSec = (id) => { out[p++] = id; const lp = p; p += 5; return lp; };
-  const endSec = (lp) => {
-    let len = p - (lp + 5);
-    for (let i = 0; i < 4; i++) { out[lp + i] = (len & 0x7f) | 0x80; len >>>= 7; }
-    out[lp + 4] = len & 0x7f;
-  };
-
-  let lp = beginSec(1);
-  p = writeUleb(out, p, types.length);
-  for (let i = 0; i < types.length; i++) {
-    const t = types[i];
-    out[p++] = 0x60;
-    p = writeUleb(out, p, t.params.length);
-    for (let j = 0; j < t.params.length; j++) out[p++] = t.params[j];
-    p = writeUleb(out, p, t.results.length);
-    for (let j = 0; j < t.results.length; j++) out[p++] = t.results[j];
-  }
-  endSec(lp);
-
-  lp = beginSec(3);
-  p = writeUleb(out, p, funcs.length);
-  for (let i = 0; i < funcs.length; i++) p = writeUleb(out, p, funcs[i].typeIdx);
-  endSec(lp);
-
-  lp = beginSec(5);
-  out[p++] = 0x01; out[p++] = 0x00; p = writeUleb(out, p, 256);
-  endSec(lp);
-
-  lp = beginSec(6);
-  p = writeUleb(out, p, gc);
-  for (let i = 0; i < gc; i++) { out[p++] = I32; out[p++] = 0x01; out[p++] = I32C; out[p++] = 0x00; out[p++] = END; }
-  endSec(lp);
-
-  const exports = [
-    ['memory', 0x02, 0], ['prepareInput', 0x00, F.prepareInput], ['prepareBatch', 0x00, F.prepareBatch],
-    ['solveAscii', 0x00, F.solveAscii], ['solveBatchJson', 0x00, F.solveBatchJson],
-    ['getOutBase', 0x00, F.getOutBase], ['getBatchOutBase', 0x00, F.getBatchOutBase],
-  ];
-  lp = beginSec(7);
-  p = writeUleb(out, p, exports.length);
-  for (let i = 0; i < exports.length; i++) {
-    const [name, kind, idx] = exports[i];
-    p = writeUleb(out, p, name.length);
-    for (let j = 0; j < name.length; j++) out[p++] = name.charCodeAt(j);
-    out[p++] = kind; p = writeUleb(out, p, idx);
-  }
-  endSec(lp);
-
-  lp = beginSec(10);
-  p = writeUleb(out, p, funcs.length);
-  for (let i = 0; i < funcs.length; i++) {
-    const fn = funcs[i], locs = fn.locals;
-    const bodyStart = p + 5;
-    let bp = bodyStart;
-    // Group consecutive locals
-    let grpCount = 0;
-    const gCounts = [], gTypes = [];
-    for (let j = 0; j < locs.length; j++) {
-      const t = locs[j];
-      if (grpCount > 0 && gTypes[grpCount - 1] === t) gCounts[grpCount - 1]++;
-      else { gCounts[grpCount] = 1; gTypes[grpCount] = t; grpCount++; }
-    }
-    bp = writeUleb(out, bp, grpCount);
-    for (let j = 0; j < grpCount; j++) { bp = writeUleb(out, bp, gCounts[j]); out[bp++] = gTypes[j]; }
-    bp = encodeBody(fn.ops, out, bp);
-    let len = bp - bodyStart;
-    for (let j = 0; j < 4; j++) { out[p + j] = (len & 0x7f) | 0x80; len >>>= 7; }
-    out[p + 4] = len & 0x7f;
-    p = bp;
-  }
-  endSec(lp);
-
-  const mod = new WebAssembly.Module(out.subarray(0, p));
-  return new WebAssembly.Instance(mod).exports;
-}
+const types=[],typeMap=new Map();
+const internType=(params,results)=>{
+const key=`${params.join(',')}=>${results.join(',')}`;
+let id=typeMap.get(key);
+if (id === undefined) { id=types.length; types.push({ params,results }); typeMap.set(key,id); }
+return id;};
+const qa=0,qb=1,qc=2,qd=3,qe=4,qf=5,qg=6,qh=7,qi=8,qj=9,qk=10,ql=11,qm=12,qn=13,qo=14,qp=15,qq=16,qr=17,qs=18,qt=19,qu=20,qv=21,qw=22,qx=23,qy=24,qz=25,qA=26,qB=27,qC=28,qD=29,qE=30,qF=31,qG=32,qH=33,qI=34,qJ=35,qK=36,qL=37,qM=38,qN=39,qO=40,qP=41,qQ=42,qR=43,qS=44,qT=45,qU=46,qV=47,qW=48,qX=49,qY=50,qZ=51,q0=52,q1=53,q2=54,q3=55,q4=56,q5=57,q6=58,q7=59,q8=60,q9=61,Qa=62,Qb=63,Qc=64,Qd=65,Qe=66,Qf=67,Qg=68,Qh=69,Qi=70,Qj=71,Qk=72,Ql=73,Qm=74,Qn=75,Qo=76,Qp=77,Qq=78,Qr=79,Qs=80,Qt=81,Qu=82,Qv=83,Qw=84,Qx=85,Qy=86,Qz=87,QA=88,QB=89,QC=90,gc=91;
+const Fa=0,Fb=1,Fc=2,Fd=3,Fe=4,Ff=5,Fg=6,Fh=7,Fi=8,Fj=9,Fk=10,Fl=11,Fm=12,Fn=13,Fo=14,Fp=15,Fq=16,Fr=17,Fs=18,Ft=19,Fu=20,Fv=21,Fw=22,fc=23;
+const funcs=new Array(fc);
+const def=(id,params,results,build)=>{
+const locals=[];
+const loc=(t=I)=>{ const idx=params.length + locals.length; locals.push(t); return idx; };
+const ops=build(loc);
+ops.push(E);funcs[id]={ typeIdx: internType(params,results),locals,ops };};
+def(Fa,[I],[],(loc)=>{
+const a=0,b=loc(),c=loc();
+return [MZ,T,c,C,16,SL,S,b,G,a,G,b,GU,UV,G,a,C,65535,A,C,16,SR,G,c,B,MG,CM1,EQ,UV,UN,EE,];});
+def(Fb,[I,I],[I],(loc)=>{
+const a=0,b=1,c=loc(),d=loc();
+return [C0,Q,qa,G,a,Q,qb,G,a,C,31,A,C,-16,AN,T,c,Q,qc,G,b,Q,qd,G,c,G,b,A,C,31,A,C,-16,AN,T,d,Q,qe,G,d,C,64,A,Y,Fa,G,c,];});
+def(Fc,[I],[I],()=>[G,0,Q,qf,G,0,C,256,A,Y,Fa,C0,]);
+def(Fd,[I,I],[I],(loc)=>{
+const a=0,b=1,c=loc(),d=loc(),e=loc(),f=loc(),g=loc(W);
+return [G,b,EZ,UV,C0,X,E,C0,S,c,G,a,S,f,G,a,G,b,A,T,d,C,16,B,S,e,C,10,VS8,S,g,BL,G,f,G,e,GT,BF1,G,c,G,f,VL,0,G,g,VE8,VBM,PP,A,S,c,G,f,C,16,A,S,f,R0,EE,BL,G,f,G,d,GEU,BF1,G,f,L8,0,C,10,EQ,G,c,A,S,c,IC,f,R0,EE,GB1,d,L8,0,C,10,NE,UV,IC,c,E,G,c,];});
+def(Fe,[],[],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc(),f=loc(),g=loc();
+const h=loc(),i=loc(),j=loc(),k=loc(),l=loc(),m=loc(),n=loc(),o=loc();
+return [P,qa,S,a,P,qc,S,b,P,qb,S,c,P,qd,S,d,G,c,G,d,G,c,G,d,LU,Z,S,e,C0,S,f,G,e,C,16,B,S,g,BL,G,f,G,g,GT,BF1,G,a,G,f,A,VL,0,G,b,G,f,A,VL,0,VE8,VBM,C,0xffff,XR,T,o,UV,G,f,G,o,TZ,A,S,f,R,2,E,G,f,C,16,A,S,f,R0,EE,BL,G,f,G,e,GEU,BF1,G,a,G,f,A,L8,0,G,b,G,f,A,L8,0,NE,BF1,IC,f,R0,EE,G,f,G,c,EQ,G,f,G,d,EQ,AN,UV,G,a,G,c,Y,Fd,Q,qg,C0,Q,qh,G,c,Q,qi,G,d,Q,qj,G,c,Q,qk,G,d,Q,ql,X,E,BL,G,f,EZ,BF1,G,a,G,f,A,C1,B,L8,0,C,10,EQ,BF1,DC,f,R0,EE,G,f,Q,qi,G,f,Q,qj,G,a,G,f,Y,Fd,Q,qg,G,c,G,f,B,S,m,G,d,G,f,B,S,n,G,m,G,n,G,m,G,n,LU,Z,S,k,C0,S,j,G,k,C,16,B,S,l,BL,G,j,G,l,GT,BF1,G,a,G,c,A,G,j,B,C,16,B,VL,0,G,b,G,d,A,G,j,B,C,16,B,VL,0,VE8,VBM,C,0xffff,XR,T,o,UV,G,j,G,o,C,16,SL,CZ,A,S,j,R,2,E,G,j,C,16,A,S,j,R0,EE,BL,G,j,G,k,GEU,BF1,G,a,G,c,A,G,j,B,C1,B,L8,0,
+G,b,G,d,A,G,j,B,C1,B,L8,0,NE,BF1,IC,j,R0,EE,G,c,G,j,B,S,h,G,d,G,j,B,S,i,G,j,C0,GT,UV,G,h,G,f,EQ,U,I,C1,H,G,a,G,h,A,C1,B,L8,0,C,10,EQ,E,G,i,G,f,EQ,U,I,C1,H,G,b,G,i,A,C1,B,L8,0,C,10,EQ,E,AN,EZ,UV,BL,G,h,G,c,GEU,BF1,G,a,G,h,A,L8,0,C,10,EQ,UV,IC,h,IC,i,R,2,E,IC,h,IC,i,R0,EE,EE,G,h,Q,qk,G,i,Q,ql,G,a,G,h,A,G,c,G,h,B,Y,Fd,Q,qh,];});
+def(Ff,[I,I,I],[I],(loc)=>{
+const a=0,b=1,c=2,d=loc();
+return [C0,S,d,BL,G,d,C,16,A,G,c,GU,BF1,G,a,G,d,A,VL,0,G,b,G,d,A,VL,0,VE8,VBM,C,0xffff,NE,UV,C0,X,E,G,d,C,16,A,S,d,R0,EE,BL,G,d,C,8,A,G,c,GU,BF1,G,a,G,d,A,L64,0,G,b,G,d,A,L64,0,I6N,UV,C0,X,E,G,d,C,8,A,S,d,R0,EE,BL,G,d,G,c,GEU,BF1,G,a,G,d,A,L8,0,G,b,G,d,A,L8,0,NE,UV,C0,X,E,IC,d,R0,EE,C1,];});
+def(Fg,[],[],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc(),f=loc();
+const g=loc(),h=loc(),i=loc(),j=loc(),k=loc(),l=loc();
+const m=loc(),n=loc(),o=loc(),p=loc(),q=loc(),r=loc();
+const s=loc(),u=loc(),v=loc(),w=loc(),x=loc(),y=loc(),z=loc(),_a=loc(),_b=loc();
+const _c=loc(J),_d=loc(J),_e=loc(J),_f=loc(J),_g=loc(J),_h=loc(J),_i=loc(W);
+const _j=loc(),_k=loc(),_l=loc(),_m=loc(),_n=loc(),_o=loc(),_p=loc(),_q=loc(),_r=loc(),_s=loc();
+const _t=loc(),_u=loc(),_v=loc(),_w=loc(),_x=loc();
+const ops=[
+P,qa,T,g,P,qi,A,P,qk,P,qi,B,Y,Fd,T,a,Q,qm,P,qc,T,h,P,qj,A,P,ql,P,qj,B,Y,Fd,T,b,Q,qn,G,a,G,b,G,a,G,b,LU,Z,S,c,P,qe,S,f,];
+const alloc=(gVar,...szOps)=>{
+ops.push(G,f,Q,gVar,G,f);
+for (let t=0; t < szOps.length; t++) ops.push(szOps[t]);
+ops.push(A,C,7,A,C,-8,AN,S,f);};alloc(qo,G,a,C,4,A,C,2,SL);alloc(qp,G,a,C,4,A,C,3,SL);alloc(qq,G,b,C,4,A,C,2,SL);
+const pushScanPlain=(baseL,stG,enG,bG)=>{
+ops.push(P,stG,S,s,P,enG,S,u,P,bG,T,_a,G,s,S32,0,BL,G,s,G,u,GEU,BF1,BL,G,s,G,u,GEU,BF1,G,baseL,G,s,A,L8,0,C,10,EQ,UV,IC,s,R,2,E,IC,s,R0,EE,G,_a,C,4,A,T,_a,G,s,S32,0,R0,EE,);};ops.push(G,a,EZ,G,b,EZ,OR,U,V);alloc(qr,C,16); alloc(qs,C,16);alloc(qt,C,16); alloc(qu,C,16);alloc(qv,C,16); alloc(qw,C,16);ops.push(G,f,Q,qx,G,f,C,64,A,Y,Fa);ops.push(G,a,U,V); pushScanPlain(g,qi,qk,qo); ops.push(E);ops.push(G,b,U,V); pushScanPlain(h,qj,ql,qq); ops.push(E);ops.push(X,E,C,16,S,d,BL,G,d,G,a,C1,SL,GEU,BF1,G,d,C1,SL,S,d,R0,EE,GB1,d,T,e,Q,qy,);alloc(qz,G,d,C,2,SL);alloc(qA,G,a,C,4,A,C,2,SL);alloc(qB,G,b,C,4,A,C,2,SL);alloc(qC,G,a,C,2,SL);alloc(qD,G,a,C,2,SL);alloc(qE,G,a,C,2,SL);alloc(qF,G,a,C,2,SL);alloc(qG,G,a,C,2,SL);alloc(qH,G,a,C,4,A,C,2,SL);
+alloc(qI,G,b,C,4,A,C,2,SL);alloc(qJ,G,a,C,4,A,C,2,SL);alloc(qK,G,b,C,4,A,C,2,SL);alloc(qL,G,c,C,4,A,C,2,SL);alloc(qM,G,c,C,4,A,C,2,SL);alloc(qN,G,a,C,4,A,C,2,SL);alloc(qO,G,c,C,4,A,C,2,SL);alloc(qP,G,c,C,4,A,C,2,SL);alloc(qQ,G,c,C,4,A,C,2,SL);alloc(qR,G,a,C,4,A);alloc(qS,G,a,C,4,A);alloc(qT,G,b,C,4,A);alloc(qU,G,b,C,4,A);alloc(qV,G,c,C,4,A);alloc(qW,G,b,C,4,A);alloc(qX,G,c,C,4,A,C,2,SL);alloc(qY,G,c,C,4,A,C,2,SL);alloc(qZ,G,c,C,4,A,C,2,SL);alloc(q0,G,c,C,4,A,C,2,SL);alloc(q1,G,b,C,4,A,C,2,SL);alloc(q2,G,c,C,4,A,C,2,SL);alloc(q3,G,c,C,4,A,C,2,SL);alloc(q4,G,a,C,4,A,C,2,SL);alloc(q5,G,b,C,4,A,C,2,SL);alloc(q6,G,c,C,4,A,C,2,SL);alloc(q7,G,c,C,4,A,C,2,SL);alloc(q8,G,c,C,4,A,C,2,SL);alloc(q9,G,c,C,4,A,C,2,SL);alloc(Qa,G,c,C,4,A,C,2,SL);alloc(Qb,G,a,C,4,A,C,2,SL);alloc(Qc,G,a,C,4,A,C,2,SL);
+alloc(Qd,G,c,C,4,A,C,2,SL);alloc(Qe,G,c,C,4,A,C,2,SL);alloc(Qf,G,c,C,4,A,C,2,SL);alloc(Qg,C,520 * 4);alloc(Qh,C,520 * 4);
+const pushHashOneLine=(baseL)=>{
+ops.push(C6,0x84222325,0xcbf29ce4,S,_f,K,V,BL,G,s,G,v,GT,BF1,G,baseL,G,s,A,VL,0,G,_i,VE8,VBM,T,z,UV,G,z,TZ,S,x,G,x,C,8,GE,UV,G,_f,G,baseL,G,s,A,L64,0,I6X,C6,0x1b3,0x100,I6M,S,_f,C6,-1,-1,C,15,G,x,B,C,3,SL,EX,I6R,S,_g,G,_f,G,baseL,G,s,A,C,8,A,L64,0,G,_g,I6A,I6X,C6,0x1b3,0x100,I6M,S,_f,H,C6,-1,-1,C,7,G,x,B,C,3,SL,EX,I6R,S,_g,G,_f,G,baseL,G,s,A,L64,0,G,_g,I6A,I6X,C6,0x1b3,0x100,I6M,S,_f,E,G,s,G,x,A,C1,A,S,s,R,3,E,G,_f,G,baseL,G,s,A,L64,0,I6X,C6,0x1b3,0x100,I6M,G,baseL,G,s,A,C,8,A,L64,0,I6X,C6,0x1b3,0x100,I6M,S,_f,G,s,C,16,A,S,s,R0,EE,BL,G,s,G,w,GT,BF1,G,baseL,G,s,A,L64,0,T,_c,C6,0x0a0a0a0a,0x0a0a0a0a,I6X,S,_d,G,_d,C6,0x01010101,0x01010101,I6S,G,_d,C6,-1,-1,I6X,I6A,C6,0x80808080,0x80808080,I6A,T,_e,I6Z,EZ,UV,G,_e,I6T,WR,C,3,SR,S,x,C6,-1,-1,C,7,G,x,B,C,3,SL,EX,I6R,S,_g,
+G,_f,G,_c,G,_g,I6A,I6X,C6,0x1b3,0x100,I6M,S,_f,G,s,G,x,A,C1,A,S,s,R,3,E,G,_f,G,_c,I6X,C6,0x1b3,0x100,I6M,S,_f,G,s,C,8,A,S,s,R0,EE,C6,0,0,S,_h,C0,S,y,BL,G,s,G,u,GEU,BF1,G,baseL,G,s,A,L8,0,S,x,G,_h,G,x,EX,G,y,EX,I6L,I6O,S,_h,G,y,C,8,A,S,y,IC,s,G,x,C,10,EQ,BF1,R0,EE,G,y,UV,G,_f,G,_h,I6X,C6,0x1b3,0x100,I6M,S,_f,EE,);};ops.push(G,f,Q,qx,G,f,C,64,A,Y,Fa,P,qz,T,l,C0,G,d,C,2,SL,MFL,P,qC,T,o,C0,G,a,C,2,SL,MFL,P,qD,T,p,C0,G,a,C,2,SL,MFL,P,Qb,C0,G,a,C,2,SL,MFL,P,qo,S,i,P,qp,S,j,P,qq,S,k,P,qA,S,m,P,qB,S,n,P,qE,S,q,P,qF,S,r,C,10,VS8,S,_i,P,qi,S,s,P,qk,S,u,G,u,C,16,B,S,v,G,u,C,8,B,S,w,G,i,G,s,S32,0,G,i,S,_a,G,j,S,_b,C0,S,_j,BL,G,_j,G,a,GEU,BF1,G,s,S,_l,);pushHashOneLine(g);ops.push(G,s,G,_l,B,S,_m,G,_a,C,4,A,T,_a,G,s,S32,0,G,_b,G,_f,S64,0,G,_b,C,8,A,S,_b,
+G,_f,G,_f,C6,32,0,I6R,I6X,WR,G,e,AN,S,_n,BL,LD,l,_n,T,_o,EZ,UV,GA1,_j,S,_s,ST,l,_n,_s,ST,m,_j,_j,SK,o,_j,1,ST,q,_j,_j,R,2,E,GB1,_o,S,_p,G,j,G,_p,C,3,SL,A,L64,0,G,_f,I6E,G,i,G,_p,SH2,T,_s,L32,4,G,_s,L32,0,T,_q,B,G,_m,EQ,AN,UV,G,g,G,_q,A,G,g,G,_l,A,G,_m,Y,Ff,UV,ST,m,_j,_p,G,o,G,_p,SH2,T,_s,G,_s,L32,0,C1,A,S32,0,R,3,EE,GA1,_n,G,e,AN,S,_n,R0,EE,IC,_j,R0,EE,);
+const emitFastEqMatch=(p1,p2,lenL)=>{
+ops.push(G,p1,VL,0,G,p2,VL,0,VE8,VBM,C,0xffff,XR,S,_s,G,lenL,C,16,LEU,UV,G,_s,C,32,G,lenL,B,SL,EZ,S,_x,H,G,_s,EZ,UV,G,lenL,C,32,LEU,UV,G,p1,G,lenL,A,C,16,B,VL,0,G,p2,G,lenL,A,C,16,B,VL,0,VE8,VBM,C,0xffff,EQ,S,_x,H,G,p1,C,16,A,G,p2,C,16,A,G,lenL,C,16,B,Y,Ff,S,_x,EE,E,);};ops.push(P,qj,S,s,P,ql,S,u,G,u,C,16,B,S,v,G,u,C,8,B,S,w,G,k,G,s,S32,0,G,k,S,_a,C0,S,_j,C0,S,_k,BL,G,_k,G,b,GEU,BF1,C0,S,_x,G,_j,S,_t,K,V,G,_t,G,a,LU,UV,G,i,G,_t,SH2,T,_s,L32,0,S,_u,G,_s,L32,4,S,_v,G,_v,G,_u,B,S,_w,G,s,G,_w,A,G,u,LEU,G,s,G,_w,A,G,u,EQ,G,g,G,_v,A,C1,B,L8,0,C,10,EQ,OR,AN,UV,G,g,G,_u,A,S,_q,G,h,G,s,A,S,_o,);emitFastEqMatch(_q,_o,_w);ops.push(G,_x,F,2,EE,GA1,_t,T,_t,G,a,LU,UV,G,i,G,_t,SH2,T,_s,L32,0,S,_u,G,_s,L32,4,S,_v,G,_v,G,_u,B,S,_w,G,s,G,_w,A,G,u,LEU,
+G,s,G,_w,A,G,u,EQ,G,g,G,_v,A,C1,B,L8,0,C,10,EQ,OR,AN,UV,G,g,G,_u,A,S,_q,G,h,G,s,A,S,_o,);emitFastEqMatch(_q,_o,_w);ops.push(E,EE,G,_x,UV,G,s,G,_w,A,S,s,G,_a,C,4,A,T,_a,G,s,S32,0,LD,m,_t,S,_p,ST,n,_k,_p,G,p,G,_p,SH2,T,_s,G,_s,L32,0,C1,A,S32,0,ST,r,_p,_k,GA1,_t,S,_j,H,G,s,S,_l,);pushHashOneLine(h);ops.push(G,s,G,_l,B,S,_m,G,_a,C,4,A,T,_a,G,s,S32,0,G,_f,G,_f,C6,32,0,I6R,I6X,WR,G,e,AN,S,_n,C,-3,S,_r,BL,LD,l,_n,T,_o,EZ,BF1,GB1,_o,S,_p,G,j,G,_p,C,3,SL,A,L64,0,G,_f,I6E,G,i,G,_p,SH2,T,_s,L32,4,G,_s,L32,0,T,_q,B,G,_m,EQ,AN,UV,G,g,G,_q,A,G,h,G,_l,A,G,_m,Y,Ff,UV,G,_p,S,_r,G,p,G,_p,SH2,T,_s,G,_s,L32,0,C1,A,S32,0,ST,r,_p,_k,LD,o,_p,C1,EQ,UV,LD,q,_p,C1,A,S,_j,H,G,_j,C,2,A,G,a,LU,UV,G,_j,C,2,A,S,_s,LD,m,_s,G,_p,EQ,UV,G,_j,C,3,A,S,_j,EE,E,R,3,EE,
+GA1,_n,G,e,AN,S,_n,R0,EE,ST,n,_k,_r,E,IC,_k,R0,EE,);
+return ops;});
+def(Fh,[],[I],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc(),f=loc(),g=loc(),h=loc(),i=loc();
+const j=loc(),k=loc(),l=loc(),m=loc(),n=loc(),o=loc(),p=loc(),q=loc();
+const r=loc(),s=loc(),u=loc(),v=loc(),w=loc(),x=loc();
+const y=loc(),z=loc(),_a=loc(),_b=loc(),_c=loc(),_d=loc(),_e=loc(),_f=loc(),_g=loc(),_h=loc(),_i=loc();
+const _j=loc(),_k=loc(),_l=loc(),_m=loc(),_n=loc(),_o=loc(),_p=loc(),_q=loc(),_r=loc();
+const _s=loc(),_t=loc(),_u=loc(),_v=loc(),_w=loc(),_x=loc(),_y=loc(),_z=loc(),_A=loc(),_B=loc(),_C=loc();
+const _D=loc(),_E=loc(),_F=loc(),_G=loc(),_H=loc(),_I=loc(),_J=loc(),_K=loc(),_L=loc(),_M=loc();
+const _N=loc(),_O=loc(),_P=loc(),_Q=loc(),_R=loc();
+const _S=loc(),_T=loc(),_U=loc(),_V=loc(),_W=loc(),_X=loc(),_Y=loc();
+const _Z=loc(),_0=loc(),_1=loc(),_2=loc(),_3=loc(),_4=loc(),_5=loc();
+const _6=loc(),_7=loc(),_8=loc(),_9=loc(),_aa=loc(),_ab=loc(),_ac=loc();
+return [P,qm,S,a,P,qn,S,b,P,qA,S,_D,P,qB,S,_E,P,Qg,S,_F,P,Qh,S,_G,P,qG,S,_S,P,qC,S,_T,P,qD,S,_U,P,qH,S,_V,P,qI,S,_W,P,qR,S,_X,P,qF,S,_Y,P,qJ,S,_Z,P,qK,S,_0,P,qL,S,_1,P,qM,S,_2,P,qN,S,_3,P,qO,S,_4,P,qP,S,_5,P,qV,S,_6,P,qU,S,_7,P,qW,S,_8,P,q1,S,_9,P,q2,S,_aa,P,q3,S,_ab,P,qT,S,_ac,G,_S,C0,G,a,C,2,SL,MFL,C0,S,e,GB1,a,S,c,BL,G,c,C0,LT,BF1,LD,_D,c,S,f,LD,_S,f,C1,A,S,g,ST,_S,f,g,G,g,LD,_U,f,GT,UV,IC,e,E,ST,_V,c,e,DC,c,R0,EE,SK,_V,a,0,G,_S,C0,G,a,C,2,SL,MFL,C0,S,e,GB1,b,S,c,BL,G,c,C0,LT,BF1,LD,_E,c,T,f,C,-3,EQ,UV,IC,e,H,LD,_S,f,C1,A,S,g,ST,_S,f,g,G,g,LD,_T,f,GT,UV,IC,e,EE,ST,_W,c,e,DC,c,R0,EE,SK,_W,b,0,G,_X,C0,G,a,MFL,G,_Z,C0,S32,0,C0,S,h,C0,S,i,C0,S,c,BL,G,c,G,a,GEU,BF1,LD,_D,c,S,f,
+LD,_T,f,C1,EQ,LD,_U,f,C1,EQ,AN,UV,G,_X,G,f,A,C1,S8,0,IC,h,LD,_Y,f,S,d,G,i,EZ,UV,G,_1,G,d,S32,0,G,_2,G,c,S32,0,SK,_3,c,-1,C1,S,i,H,GB1,i,S,l,LD,_1,l,G,d,LT,UV,ST,_1,i,d,ST,_2,i,c,LD,_2,l,S,_r,ST,_3,c,_r,IC,i,H,C0,S,j,G,i,S,k,BL,G,j,G,k,GE,BF1,G,j,G,k,A,C1,SR,S,l,LD,_1,l,G,d,LT,UV,GA1,l,S,j,H,G,l,S,k,E,R0,EE,ST,_1,j,d,ST,_2,j,c,G,j,C0,GT,U,I,GB1,j,S,l,LD,_2,l,H,CM1,E,S,_r,ST,_3,c,_r,EE,E,GA1,c,T,c,ST,_Z,c,h,R0,EE,G,_0,C0,S32,0,C0,S,e,C0,S,c,BL,G,c,G,b,GEU,BF1,LD,_E,c,T,f,C0,GE,UV,G,e,G,_X,G,f,A,L8,0,A,S,e,E,GA1,c,T,c,ST,_0,c,e,R0,EE,P,qS,C0,G,a,MFL,P,qT,C0,G,b,MFL,G,i,C0,GT,U,I,GB1,i,S,l,LA,qM,l,H,CM1,E,S,m,G,i,S,n,BL,G,n,C1,LT,BF1,SA,qO,n,m,LD,_D,m,S,f,LA,qF,f,S,_r,SA,qP,n,_r,S8C,qS,m,1,S8C,qT,_r,1,
+LA,qN,m,S,m,DC,n,R0,EE,P,qO,CM1,S32,0,P,qP,CM1,S32,0,GA1,i,S,l,SA,qO,l,a,SA,qP,l,b,G,_6,C0,G,i,C,2,A,MFL,CM1,S,_u,C1,S,n,C0,S,c,BL,G,c,G,a,GEU,BF1,LD,_D,c,S,f,G,_X,G,f,A,L8,0,UV,LD,_Y,f,S,s,G,n,G,i,LE,UV,LD,_4,n,G,c,EQ,UV,G,_u,LD,_5,n,LT,UV,G,_6,G,n,A,C1,S8,0,E,IC,n,EE,G,s,G,_u,GT,UV,G,s,S,_u,EE,IC,c,R0,EE,G,b,S,_v,G,i,S,n,GB1,a,S,c,BL,G,c,C0,LT,BF1,LD,_D,c,S,f,G,_X,G,f,A,L8,0,UV,LD,_Y,f,S,s,G,n,C1,GE,UV,LD,_4,n,G,c,EQ,UV,G,_v,LD,_5,n,LE,UV,G,_6,G,n,A,C0,S8,0,E,DC,n,EE,G,s,G,_v,LT,UV,G,s,S,_v,EE,DC,c,R0,EE,C0,S,y,C0,S,z,BL,G,z,G,i,GT,BF1,LA,qO,z,C1,A,S,_a,LA,qP,z,C1,A,S,_b,GA1,z,S,l,LA,qO,l,G,_a,B,S,_e,LA,qP,l,G,_b,B,S,_f,G,_e,C0,GT,G,_f,C0,GT,AN,UV,
+G,_D,G,_a,SH2,S,_H,G,_E,G,_b,SH2,S,_I,BL,G,_e,C0,LE,G,_f,C0,LE,OR,BF1,G,_H,L32,0,G,_I,L32,0,NE,BF1,IC,_a,IC,_b,G,_H,C,4,A,S,_H,G,_I,C,4,A,S,_I,DC,_e,DC,_f,R0,EE,BL,G,_e,C0,LE,G,_f,C0,LE,OR,BF1,GB1,_e,S,m,GB1,_f,S,l,LD,_H,m,LD,_I,l,NE,BF1,G,m,S,_e,G,l,S,_f,R0,EE,C0,S,_r,K,V,G,_e,EZ,G,_f,EZ,OR,UV,G,_e,G,_f,A,S,_r,R,1,E,G,_e,C1,EQ,G,_f,C1,EQ,AN,UV,C,2,S,_r,R,1,E,G,_e,G,_f,A,S,l,C,256,G,l,C,256,G,l,LT,Z,S,_g,G,_a,G,_e,A,S,m,LD,_D,m,S,_h,G,_b,G,_f,A,S,l,LD,_E,l,S,_i,SK,_D,m,-1,SK,_E,l,-2,C0,S,_c,BL,LD,_H,_c,LD,_I,_c,NE,BF1,IC,_c,R0,EE,G,_F,G,_c,S32,0,C0,S,_q,C1,S,q,BL,G,q,G,_g,GT,BF1,C0,S,p,C0,G,q,B,S,_j,BL,G,p,G,q,GT,BF1,G,p,C0,GT,U,I,GB1,p,S,j,LD,_F,j,H,CM2,E,S,_k,
+G,p,G,q,LT,U,I,LD,_F,p,H,CM2,E,S,_l,G,_k,C0,GE,G,_k,G,_e,LT,AN,S,_m,G,_l,C0,GE,G,_l,G,_j,B,C1,B,G,_f,LT,AN,S,_n,G,_m,G,_n,EZ,GA1,_k,G,_l,GE,OR,AN,U,I,GA1,_k,H,G,_n,U,I,G,_l,H,CM2,EE,S,_o,G,_o,C0,LT,UV,SK,_G,p,-2,H,G,_o,G,_j,B,S,_p,BL,LD,_H,_o,LD,_I,_p,NE,BF1,IC,_o,IC,_p,R0,EE,G,_o,G,_e,EQ,G,_p,G,_f,EQ,AN,UV,G,q,S,_r,C1,S,_q,R,5,E,ST,_G,p,_o,E,IC,p,G,_j,C,2,A,S,_j,R0,EE,G,_F,S,j,G,_G,S,_F,G,j,S,_G,IC,q,R0,EE,ST,_D,m,_h,ST,_E,l,_i,G,_q,EZ,UV,G,_e,G,_f,A,S,_r,EE,H,G,_e,G,_f,A,S,_r,E,SA,qQ,z,_r,G,y,G,_r,A,S,y,IC,z,R0,EE,G,y,Q,Qi,P,qU,C0,G,b,MFL,C0,S,w,C1,S,o,C0,S,r,BL,G,r,G,a,GEU,BF1,LD,_D,r,S,f,L8G,qR,f,L8G,qS,r,EZ,AN,UV,LA,qF,f,S,s,BL,G,o,G,i,GT,BF1,LA,qO,o,G,r,GE,BF1,IC,o,R0,EE,
+CM1,S,x,C0,S,q,BL,G,q,C,16,GT,BF1,G,o,G,q,A,S,p,G,p,C1,GE,G,p,G,i,LE,AN,UV,LA,qP,p,S,v,L8G,qU,v,EZ,UV,LA,qO,p,S,u,G,u,G,r,B,T,_r,C,-16,GE,G,_r,C,16,LE,AN,UV,G,r,G,u,LT,G,s,G,v,GT,AN,G,r,G,u,GT,G,s,G,v,LT,AN,OR,UV,G,p,S,x,R,5,EE,EE,GB1,o,G,q,B,S,p,G,p,C1,GE,G,p,G,i,LE,AN,UV,LA,qP,p,S,v,L8G,qU,v,EZ,UV,LA,qO,p,S,u,G,u,G,r,B,T,_r,C,-16,GE,G,_r,C,16,LE,AN,UV,G,r,G,u,LT,G,s,G,v,GT,AN,G,r,G,u,GT,G,s,G,v,LT,AN,OR,UV,G,p,S,x,R,5,EE,EE,IC,q,R0,EE,G,x,C0,GT,UV,LA,qO,x,S,u,LA,qP,x,S,v,S8C,qU,s,1,S8C,qU,v,1,SA,qX,w,r,SA,qY,w,s,SA,qZ,w,u,SA,q0,w,v,IC,w,EE,IC,r,R0,EE,G,_9,C0,S32,0,C0,S,_P,C0,S,_N,C0,S,c,BL,G,c,G,b,GEU,BF1,G,_P,G,_N,GE,UV,G,_8,G,c,A,C1,S8,0,G,_P,S,_N,H,G,_8,G,c,A,C0,S8,0,E,C0,S,_Q,G,_7,G,c,A,L8,0,EZ,UV,
+LD,_E,c,T,f,C0,GE,UV,LD,_T,f,C0,GT,UV,G,_ac,G,c,A,L8,0,U,I,C,2,H,CM2,E,S,_Q,EE,E,G,_P,G,_Q,A,S,_P,GA1,c,T,c,ST,_9,c,_P,R0,EE,G,_P,S,_O,GB1,b,S,c,BL,G,c,C0,LT,BF1,GA1,c,S,_r,LD,_9,_r,T,_P,G,_O,LT,UV,G,_P,S,_O,E,LD,_9,c,G,_O,GT,UV,G,_8,G,c,A,C0,S8,0,E,DC,c,R0,EE,G,_aa,C0,S32,0,G,_ab,C0,S32,0,C0,S,_J,C1,S,n,BL,G,n,G,i,GT,BF1,LD,_4,n,S,r,LD,_5,n,S,s,G,r,C0,GT,G,s,C0,GT,AN,G,_7,G,s,A,L8,0,EZ,AN,G,_8,G,s,A,L8,0,AN,UV,IC,_J,ST,_aa,_J,r,ST,_ab,_J,s,E,IC,n,R0,EE,GA1,_J,T,_J,Q,Qj,ST,_aa,_J,a,ST,_ab,_J,b,C0,S,d,BL,G,d,G,_J,GEU,BF1,LA,q2,d,S,_a,GA1,d,S,_r,LA,q2,_r,S,_c,BL,G,_a,G,_c,GEU,BF1,SA,q4,_a,d,IC,_a,R0,EE,LA,q3,d,S,_b,LA,q3,_r,S,_d,BL,G,_b,G,_d,GEU,BF1,SA,q5,_b,d,IC,_b,R0,
+EE,IC,d,R0,EE,SA,q4,a,_J,SA,q5,b,_J,P,q6,C0,G,_J,C,2,SL,MFL,C0,S,c,BL,G,c,G,w,GEU,BF1,LA,qX,c,S,r,LA,q4,r,S,d,GA1,d,S,_r,LA,qZ,c,S,u,LA,qY,c,S,s,LA,q0,c,S,v,G,u,LA,q2,d,GE,G,u,LA,q2,_r,LT,AN,G,s,LA,q3,d,GE,AN,G,s,LA,q3,_r,LT,AN,G,v,LA,q3,d,GE,AN,G,v,LA,q3,_r,LT,AN,UV,LA,q6,d,C1,A,S,m,SA,q6,d,m,E,IC,c,R0,EE,C0,S,d,BL,G,d,G,_J,GEU,BF1,GA1,d,T,_K,LA,q2,_K,S,_c,LA,q2,d,S,_a,LA,q3,_K,S,_d,LA,q3,d,S,_b,G,_c,G,_a,B,S,_L,G,_d,G,_b,B,S,_M,G,_a,S,m,BL,G,m,G,_c,GEU,BF1,LD,_D,m,S,f,LA,Qb,f,G,_K,NE,UV,SA,Qb,f,_K,SC,Qc,f,1,H,LA,Qc,f,C1,A,S,_r,SA,Qc,f,_r,E,IC,m,R0,EE,G,_b,S,m,BL,G,m,G,_d,GEU,BF1,LD,_E,m,T,f,C0,GE,UV,LA,Qb,f,G,_K,EQ,UV,LA,Qc,f,T,_r,C0,GT,UV,DC,_r,SA,Qc,f,_r,DC,_L,DC,_M,EE,E,
+IC,m,R0,EE,LA,q1,_d,LA,q1,_b,B,T,_r,C0,LT,U,I,G,_r,C1,SS,H,C0,E,S,_R,LA,q6,d,S,g,G,_L,G,g,A,G,_R,A,T,_r,C0,GT,U,I,G,_r,H,C0,E,S,_L,G,_M,G,g,A,G,_R,A,T,_r,C0,GT,U,I,G,_r,H,C0,E,S,_M,SA,q7,d,_L,SA,q8,d,_M,IC,d,R0,EE,SC,q9,_J,0,SC,Qa,_J,0,GA1,_J,S,_r,SC,q9,_r,0,SC,Qa,_r,0,GB1,_J,S,d,BL,G,d,C0,LT,BF1,GA1,d,S,_r,LA,q9,_r,LA,q7,d,A,S,_L,SA,q9,d,_L,LA,Qa,_r,LA,q8,d,A,S,_M,SA,Qa,d,_M,DC,d,R0,EE,P,qH,L32,0,P,qI,L32,0,A,G,h,G,i,B,C1,SL,A,S,_s,G,y,G,_s,B,S,_t,P,Qd,C0,S32,0,P,Qe,C0,S32,0,C0,S,_z,C0,S,m,C0,S,_B,C1,S,n,BL,G,n,G,i,GT,BF1,LA,qO,n,S,_w,LA,qP,n,S,_x,G,_w,G,m,LT,UV,IC,n,R,1,E,C0,S,_y,G,n,S,_C,BL,G,_w,G,a,GE,G,_x,G,b,GE,OR,BF1,LD,_D,_w,LD,_E,_x,NE,BF1,G,_C,G,i,LE,UV,LA,qO,_C,G,_w,EQ,UV,
+G,_y,L8G,qV,_C,A,S,_y,IC,_C,EE,IC,_w,IC,_x,R0,EE,G,_w,G,a,LT,G,_x,G,b,LT,AN,G,_y,C1,SL,G,_t,GT,AN,UV,C0,S,_A,G,_B,S,z,BL,G,z,G,n,GE,BF1,G,_A,LA,qQ,z,A,S,_A,IC,z,R0,EE,SA,Qf,_z,_A,IC,_z,SA,Qd,_z,_w,SA,Qe,_z,_x,G,_w,S,m,GB1,_C,S,_B,E,G,_C,S,n,R0,EE,C0,S,_A,G,_B,S,z,BL,G,z,G,i,GT,BF1,G,_A,LA,qQ,z,A,S,_A,IC,z,R0,EE,SA,Qf,_z,_A,GA1,_z,T,_z,Q,Qk,SA,Qd,_z,a,SA,Qe,_z,b,G,y,];});
+def(Fi,[I,I,I,I,I,I],[],(loc)=>{
+const a=0,b=1,c=2,d=3,e=4,f=5;
+const g=loc(),h=loc(),i=loc(),j=loc(),k=loc(),l=loc();
+const m=loc(),n=loc(),o=loc(),p=loc(),q=loc();
+const r=loc(),s=loc(),u=loc(),v=loc();
+const w=loc(),x=loc(),y=loc(),z=loc(),_a=loc(),_b=loc(),_c=loc();
+const _d=loc(),_e=loc(),_f=loc(),_g=loc(),_h=loc(),_i=loc();
+const _j=loc(),_k=loc(),_l=loc(),_m=loc(),_n=loc(),_o=loc();
+const _p=loc(),_q=loc(),_r=loc(),_s=loc(),_t=loc(),_u=loc(),_v=loc(),_w=loc(),_x=loc(),_y=loc();
+const _z=loc(),_A=loc(),_B=loc(),_C=loc(),_D=loc();
+const _E=loc(),_F=loc(),_G=loc(),_H=loc(),_I=loc(),_J=loc(),_K=loc(),_L=loc();
+const _M=loc(),_N=loc(),_O=loc(),_P=loc(),_Q=loc(),_R=loc(),_S=loc();
+const _T=loc(),_U=loc(),_V=loc(),_W=loc(),_X=loc(),_Y=loc(),_Z=loc();
+const _0=loc(),_1=loc(),_2=loc(),_3=loc(),_4=loc(),_5=loc();
+const _6=loc(),_7=loc(),_8=loc(),_9=loc(),_aa=loc(),_ab=loc(),_ac=loc();
+const _ad=loc(),_ae=loc(),_af=loc(),_ag=loc(),_ah=loc(),_ai=loc(),_aj=loc(),_ak=loc();
+const ops=[
+G,c,G,a,B,S,g,G,d,G,b,B,S,h,P,Ql,S,_F,G,g,EZ,G,h,EZ,AN,UV,X,E,P,q4,S,_ad,P,q5,S,_ae,P,qJ,S,_af,P,qK,S,_ag,P,Qa,S,_ah,P,qI,S,_ai,P,q9,S,_aj,P,qH,S,_ak,];
+const emitPushOp=(kindOp0,kindOp1,cntOp0,cntOp1)=>{
+ops.push(G,_F,C0,GT,U,I,GB1,_F,S,_y,L8G,Qm,_y,kindOp0,kindOp1,EQ,H,C0,E,UV,GB1,_F,S,_y,LA,Qn,_y,cntOp0,cntOp1,A,S,_s,SA,Qn,_y,_s,H,P,Qm,G,_F,A,kindOp0,kindOp1,S8,0,P,Qn,G,_F,SH2,cntOp0,cntOp1,S32,0,IC,_F,E,);};
+const emitIsValid=(kL)=>{
+ops.push(LD,_ad,_l,S,_p,LD,_ae,_m,S,_q,G,_p,G,_q,G,_p,G,_q,GT,Z,S,_r,G,_r,G,q,LU,U,I,GA1,_r,H,G,q,E,S,_y,LD,_af,_l,S,_s,LD,_ag,_m,S,_t,G,_s,G,_t,GT,U,I,G,_s,G,_t,B,H,C0,E,S,_u,G,_t,G,_s,GT,U,I,G,_t,G,_s,B,H,C0,E,S,_v,LD,_ah,_y,T,_x,LD,_ai,_m,G,_u,A,T,_w,G,_x,G,_w,GT,Z,C1,SL,G,_b,G,kL,A,LE,LD,_aj,_y,T,_w,LD,_ak,_l,G,_v,A,T,_x,G,_w,G,_x,GT,Z,C1,SL,G,_c,G,kL,B,LE,AN,);};ops.push(G,g,EZ,U,V); emitPushOp(C,IN,G,h); ops.push(G,_F,Q,Ql,X,E);ops.push(G,h,EZ,U,V); emitPushOp(C,DL,G,g); ops.push(G,_F,Q,Ql,X,E);ops.push(G,g,G,h,B,S,i,P,Qj,S,q,G,e,C,8192,LE,UV,C,5,S,r,C,32,S,s,C,31,S,u,H,C,7,S,r,C,128,S,s,C,127,S,u,E,G,s,C,4,A,S,_E,P,qx,S,j,G,j,C,16,A,T,o,Q,Qo,G,o,G,e,C,12,A,SH2,S,j,G,j,C,16,A,T,p,Q,Qp,G,p,G,e,C,12,A,SH2,T,j,Q,Qq,G,j,GA1,s,G,_E,M,SH2,S,j,
+G,e,G,r,SR,C,2,A,S,v,G,j,Q,Qr,G,j,G,v,C,4,SL,A,S,j,G,j,Q,Qs,G,j,Q,Qt,G,j,C,1048576,A,T,_y,Q,Qu,G,_y,Y,Fa,G,o,C,-16,A,CM2,G,e,C,12,A,C,2,SL,MFL,G,p,C,-16,A,CM2,G,e,C,12,A,C,2,SL,MFL,P,qA,G,a,SH2,S,m,P,qB,G,b,SH2,S,n,LA,qA,c,S,k,LA,qB,d,S,l,SC,qA,c,-1,SC,qB,d,-2,C0,S,w,BL,LD,m,w,LD,n,w,NE,BF1,IC,w,R0,EE,G,o,G,w,S32,0,P,Qr,S,_A,G,_A,C0,S32,0,G,_A,C0,S32,4,G,_A,C0,S32,8,G,_A,P,Qt,S32,12,P,Qt,G,w,S32,0,P,Qt,C,4,A,Q,Qt,C1,S,_z,C0,S,_C,C0,S,_D,C0,S,x,C0,S,y,G,w,G,g,LT,G,w,G,h,LT,OR,UV,C1,S,z,BL,G,z,G,e,GT,BF1,G,e,G,z,B,S,_a,G,_a,G,i,B,S,_b,G,_a,G,i,A,S,_c,GB1,x,S,_l,C0,G,_b,B,S,_m,G,_l,G,_m,G,_l,G,_m,GT,Z,S,_d,GA1,y,S,_l,G,_c,S,_m,G,_l,G,_m,G,_l,G,_m,LT,Z,S,_e,G,_d,G,z,XR,C1,AN,UV,IC,_d,E,G,_e,G,z,XR,C1,AN,UV,DC,_e,E,
+G,_d,G,z,A,C1,SS,S,_f,G,_e,G,z,A,C1,SS,S,_g,GB1,_f,S,_y,SK,p,_y,-2,GA1,_g,S,_y,SK,p,_y,-2,SK,o,z,-2,G,_f,S,_h,G,_d,S,_i,GB1,_f,S,_y,LD,o,_y,S,_j,BL,G,_h,G,_g,GT,BF1,LD,o,_h,S,_k,G,_j,G,g,LU,S,_n,G,_k,C0,GE,G,_k,G,_i,B,C1,B,G,h,LU,AN,S,_o,G,_n,G,_o,EZ,GA1,_j,G,_k,GE,OR,AN,U,I,GA1,_j,H,G,_o,U,I,G,_k,H,CM2,EE,S,_l,G,_l,C0,LT,UV,SK,p,_h,-2,H,G,_l,G,_i,B,S,_m,BL,LD,m,_l,LD,n,_m,NE,BF1,IC,_l,IC,_m,R0,EE,G,_l,G,g,EQ,G,_m,G,h,EQ,AN,UV,G,z,S,_C,G,_i,S,_D,R,5,E,ST,p,_h,_l,E,G,_k,S,_j,IC,_h,G,_i,C,2,A,S,_i,R0,EE,G,f,UV,BL,G,_f,G,_g,GT,BF1,LD,p,_f,S,_l,G,_l,C0,GE,UV,G,_l,G,_d,B,S,_m,);emitIsValid(_d);ops.push(F,2,SK,p,_f,-2,E,IC,_f,G,_d,C,2,A,S,_d,R0,EE,BL,G,_f,G,_g,GT,BF1,LD,p,_g,S,_l,G,_l,C0,GE,UV,
+G,_l,G,_e,B,S,_m,);emitIsValid(_e);ops.push(F,2,SK,p,_g,-2,E,DC,_g,G,_e,C,2,B,S,_e,R0,EE,H,BL,G,_f,G,_g,GT,BF1,LD,p,_f,C0,GE,BF1,IC,_f,G,_d,C,2,A,S,_d,R0,EE,BL,G,_f,G,_g,GT,BF1,LD,p,_g,C0,GE,BF1,DC,_g,G,_e,C,2,B,S,_e,R0,EE,E,G,_d,S,x,G,_e,S,y,G,o,S,_y,G,p,T,o,Q,Qo,G,_y,T,p,Q,Qp,G,z,G,u,AN,EZ,UV,G,_g,G,_f,B,C1,A,C,2,SL,S,_B,G,_B,C0,LT,UV,C0,S,_B,E,P,Qt,G,_B,A,P,Qu,GU,UV,P,Qt,G,_B,A,C,1048576,A,T,_y,Q,Qu,G,_y,Y,Fa,E,P,Qr,G,_z,C,4,SL,A,S,_A,G,_A,G,_f,S32,0,G,_A,G,_d,S32,4,G,_A,G,_e,S32,8,G,_A,P,Qt,S32,12,G,_B,C0,GT,UV,P,Qt,G,o,G,_f,SH2,G,_B,MCP,P,Qt,G,_B,A,Q,Qt,E,IC,_z,E,IC,z,R0,EE,E,G,_C,S,_G,G,_D,S,_H,G,g,S,_I,BL,G,_G,C0,LE,BF1,GB1,_G,G,r,SR,S,_J,G,_J,G,r,SL,S,_K,G,_G,G,_K,B,S,_L,
+P,Qr,G,_J,C,4,SL,A,S,_A,G,_A,L32,0,S,_N,G,_A,L32,4,S,_O,G,_A,L32,8,S,_P,G,_A,L32,12,S,_M,G,_H,G,_L,B,S,_Q,G,_O,G,_Q,G,_O,G,_Q,GT,Z,S,_R,G,_H,G,_L,A,S,_y,G,_P,G,_y,G,_P,G,_y,LT,Z,S,_S,P,Qq,CM2,G,_L,C,3,A,C,2,SL,MFL,G,_R,S,_i,BL,G,_i,G,_S,GT,BF1,G,_i,G,_Q,B,C1,SS,S,_5,G,_i,G,_K,A,C1,SS,G,_N,B,S,_y,LD,_M,_y,S,_l,SA,Qq,_5,_l,G,_i,C,2,A,S,_i,R0,EE,G,_R,S,_T,G,_S,S,_U,C1,S,_V,BL,G,_V,G,_L,GT,BF1,G,_K,G,_V,A,S,z,G,e,G,z,B,S,_a,G,_a,G,i,B,S,_b,G,_a,G,i,A,S,_c,G,_H,G,_L,G,_V,B,B,S,_W,G,_H,G,_L,G,_V,B,A,S,_X,GB1,_T,S,_l,C0,G,_b,B,S,_m,G,_l,G,_m,G,_l,G,_m,GT,Z,S,_Y,G,_W,G,_Y,G,_W,G,_Y,GT,Z,S,_Y,GA1,_U,S,_l,G,_c,S,_m,G,_l,G,_m,G,_l,G,_m,LT,Z,S,_Z,G,_X,G,_Z,G,_X,G,_Z,LT,Z,S,_Z,G,_Y,G,z,XR,C1,AN,UV,IC,_Y,E,G,_Z,G,z,XR,C1,AN,UV,DC,_Z,E,
+GB1,_V,G,_E,M,S,_0,G,_V,G,_E,M,S,_1,G,_Q,G,_V,B,S,_2,G,_Y,G,_2,B,C1,SS,S,_3,G,_Z,G,_2,B,C1,SS,S,_4,G,_3,C0,GT,UV,G,_1,G,_3,A,C1,B,S,_y,SC,Qq,_y,-2,E,G,_1,G,_4,A,C1,A,S,_y,SC,Qq,_y,-2,G,_Y,S,_i,BL,G,_i,G,_Z,GT,BF1,G,_i,G,_2,B,C1,SS,S,_5,GB1,_i,T,_y,G,_T,GE,G,_y,G,_U,LE,AN,U,I,G,_0,G,_5,A,C1,B,S,_y,LA,Qq,_y,H,CM2,E,S,_j,GA1,_i,T,_y,G,_T,GE,G,_y,G,_U,LE,AN,U,I,G,_0,G,_5,A,S,_y,LA,Qq,_y,H,CM2,E,S,_k,G,_j,G,g,LU,S,_n,G,_k,C0,GE,G,_k,G,_i,B,C1,B,G,h,LU,AN,S,_o,G,_n,G,_o,EZ,GA1,_j,G,_k,GE,OR,AN,U,I,GA1,_j,H,G,_o,U,I,G,_k,H,CM2,EE,S,_l,G,_1,G,_5,A,S,_y,G,_l,C0,LT,UV,SC,Qq,_y,-2,H,G,_l,G,_i,B,S,_m,BL,LD,m,_l,LD,n,_m,NE,BF1,IC,_l,IC,_m,R0,EE,SA,Qq,_y,_l,E,G,_i,C,2,A,S,_i,R0,EE,G,_V,G,_L,LT,G,f,AN,UV,BL,G,_3,G,_4,GT,BF1,
+G,_1,G,_3,A,S,_5,LA,Qq,_5,S,_l,G,_l,C0,GE,UV,G,_l,G,_Y,B,S,_m,);emitIsValid(_Y);ops.push(F,2,SC,Qq,_5,-2,E,IC,_3,G,_Y,C,2,A,S,_Y,R0,EE,BL,G,_3,G,_4,GT,BF1,G,_1,G,_4,A,S,_5,LA,Qq,_5,S,_l,G,_l,C0,GE,UV,G,_l,G,_Z,B,S,_m,);emitIsValid(_Z);ops.push(F,2,SC,Qq,_5,-2,E,DC,_4,G,_Z,C,2,B,S,_Z,R0,EE,E,G,_Y,S,_T,G,_Z,S,_U,IC,_V,R0,EE,G,_I,S,_6,G,_H,S,_7,G,_L,S,_V,BL,G,_V,C1,LT,BF1,GB1,_V,G,_E,M,S,_0,G,_Q,G,_V,B,S,_2,G,_7,G,_2,B,C1,SS,S,_5,G,_5,C0,GT,U,I,G,_0,G,_5,A,C1,B,S,_y,LA,Qq,_y,H,CM2,E,S,_j,G,_0,G,_5,A,S,_y,LA,Qq,_y,S,_k,G,_j,G,g,LU,S,_n,G,_k,C0,GE,G,_k,G,_7,B,C1,B,G,h,LU,AN,S,_o,G,_n,G,_o,EZ,GA1,_j,G,_k,GE,OR,AN,UV,GA1,_j,S,_8,C,DL,S,_9,GB1,_7,S,_aa,G,_j,S,_ab,H,G,_k,S,_8,C,IN,S,_9,GA1,_7,S,_aa,G,_k,S,_ab,E,
+G,_6,G,_8,B,T,_ac,C0,GT,UV,);emitPushOp(C,KP,G,_ac);ops.push(E);emitPushOp(G,_9,C,1);ops.push(G,_aa,S,_7,G,_ab,S,_6,DC,_V,R0,EE,G,_K,S,_G,G,_7,S,_H,G,_6,S,_I,R0,EE,G,_I,C0,GT,UV,);emitPushOp(C,KP,G,_I);ops.push(E,G,_F,Q,Ql,SA,qA,c,k,SA,qB,d,l,);
+return ops;});
+def(Fj,[],[],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc(),f=loc(),g=loc(),h=loc(),i=loc(),j=loc();
+return [P,qx,S,a,G,a,Q,Qm,G,a,P,Qi,C1,SL,C,64,A,C,7,A,C,-8,AN,A,S,a,G,a,Q,Qn,G,a,P,Qi,C1,SL,C,64,A,SH2,S,a,G,a,Q,qx,G,a,C,64,A,Y,Fa,C0,Q,Ql,P,Qk,S,b,G,b,C1,EQ,S,j,GB1,b,S,c,BL,G,c,C0,LT,BF1,GA1,c,S,d,LA,Qd,c,S,e,LA,Qe,c,S,f,LA,Qd,d,S,g,LA,Qe,d,S,h,LA,Qf,c,S,i,G,e,G,f,G,g,G,h,G,i,G,j,Y,Fi,DC,c,R0,EE,];});
+def(Fk,[],[],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc(),f=loc(),g=loc(),h=loc(),i=loc();
+const j=loc(),k=loc(),l=loc(),m=loc(),n=loc(),o=loc();
+return [P,Ql,S,a,P,qx,S,b,G,b,Q,qr,G,b,G,a,C,4,A,SH2,S,b,G,b,Q,qs,G,b,G,a,C,4,A,SH2,S,b,G,b,Q,qt,G,b,G,a,C,4,A,SH2,S,b,G,b,Q,qu,G,b,G,a,C,4,A,SH2,S,b,G,b,Q,qv,G,b,G,a,C,4,A,SH2,S,b,G,b,Q,qw,G,b,G,a,C,4,A,SH2,S,b,G,b,Q,qx,G,b,C,64,A,Y,Fa,P,qg,T,f,S,g,C0,S,h,C0,S,i,C0,S,j,GB1,a,S,c,BL,G,c,C0,LT,BF1,L8G,Qm,c,S,d,LA,Qn,c,S,e,G,d,C,KP,EQ,UV,G,f,G,e,A,S,f,G,g,G,e,A,S,g,H,GB1,j,S,k,G,k,C0,LT,U,I,C1,H,LA,qr,k,LA,qt,k,A,G,f,NE,LA,qs,k,LA,qu,k,A,G,g,NE,OR,E,UV,SA,qr,j,f,SA,qs,j,g,SC,qt,j,0,SC,qu,j,0,G,j,S,k,IC,j,E,G,d,C,DL,EQ,UV,LA,qt,k,G,e,A,S,o,SA,qt,k,o,G,f,G,e,A,S,f,G,h,G,e,A,S,h,H,LA,qu,k,G,e,A,S,o,SA,qu,k,o,G,g,G,e,A,S,g,G,i,G,e,A,S,i,EE,DC,c,R0,EE,G,j,Q,Qv,G,h,Q,Qw,G,i,Q,Qx,C0,S,l,C0,S,m,BL,G,m,G,j,GE,BF1,
+G,l,C0,GT,UV,GB1,l,S,o,LA,qw,o,S,n,LA,qr,m,LA,qr,n,LA,qt,n,A,B,C,6,LE,UV,SA,qw,o,m,IC,m,R,2,EE,SA,qv,l,m,SA,qw,l,m,IC,l,IC,m,R0,EE,G,l,Q,Qy,];});
+def(Fl,[I,I],[I],(loc)=>{
+const a=0,b=1,c=loc(),d=loc(),e=loc(),f=loc();
+return [G,b,EZ,UV,G,a,C,48,S8,0,GA1,a,X,E,G,a,S,c,BL,G,b,EZ,BF1,G,a,G,b,C,10,RM,C,48,A,S8,0,IC,a,G,b,C,10,DV,S,b,R0,EE,G,c,S,d,GB1,a,S,e,BL,G,d,G,e,GEU,BF1,G,d,L8,0,S,f,G,d,G,e,L8,0,S8,0,G,e,G,f,S8,0,IC,d,DC,e,R0,EE,G,a,];});
+def(Fm,[I,I,I,I,I],[I],(loc)=>{
+const a=0,b=1,c=2,d=3,e=4,f=loc();
+return [G,a,G,e,S8,0,IC,a,G,d,G,c,B,S,f,G,a,G,b,G,c,A,G,f,MCP,G,a,G,f,A,S,a,G,b,G,d,A,C1,B,L8,0,C,10,NE,UV,G,a,C,10,S8,0,G,a,C,37,S8,1,G,a,C,10,S8,2,G,a,C,3,A,S,a,E,G,a,];});
+def(Fn,[],[],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc(),f=loc(),g=loc(),h=loc(),i=loc();
+const j=loc(),k=loc(),l=loc(),m=loc(),n=loc(),o=loc(),p=loc(),q=loc(),r=loc();
+const s=loc(),u=loc(),v=loc(),w=loc(),x=loc(),y=loc(),z=loc(),_a=loc(),_b=loc(),_c=loc(),_d=loc();
+const _e=loc(),_f=loc(),_g=loc(),_h=loc(),_i=loc(),_j=loc();
+const _k=loc(),_l=loc(),_m=loc(),_n=loc(),_o=loc(),_p=loc(),_q=loc(),_r=loc(),_s=loc(),_t=loc(),_u=loc();
+const _v=loc(),_w=loc(),_x=loc();
+const ops=[
+P,qg,S,e,P,qh,S,f,P,qm,S,g,P,qn,S,h,P,Qy,S,i,G,e,G,g,A,G,f,A,S,c,G,e,G,h,A,G,f,A,S,d,P,qa,S,j,P,qc,S,k,P,qi,S,l,P,qk,S,m,P,qb,S,n,P,qo,S,_s,P,qq,S,_t,P,qx,S,b,G,b,S,q,G,b,C,16,A,S,b,G,b,S,r,G,b,C,16,A,S,b,G,b,T,a,Q,Qz,G,n,P,qd,A,G,c,G,d,A,SH2,G,i,C,6,SL,A,C,512,A,S,_r,G,a,G,_r,A,Y,Fa,G,a,S,b,];
+const emitHdr=(key)=>{
+const [off, len] = HDR_MAP[key];
+ops.push(G,b,C,off,C,len,MNT,G,b,C,len,A,S,b);};
+const emitPushOld=(opByte)=>{
+ops.push(G,_k,G,e,GE,G,_k,G,e,G,g,A,LT,AN,UV,G,_k,G,e,B,S,_x,G,_s,G,_x,SH2,T,_u,L32,0,S,_v,G,_u,L32,4,S,_w,H,G,_k,G,e,LT,UV,G,_k,G,e,G,o,B,B,S,_x,G,q,G,_x,SH2,T,_x,L32,0,S,_v,G,_x,L32,4,S,_w,H,G,_k,G,e,G,g,A,B,S,_x,G,r,G,_x,SH2,T,_x,L32,0,S,_v,G,_x,L32,4,S,_w,EE,G,b,G,j,G,_v,G,_w,C,opByte,Y,Fm,S,b,);};emitHdr('makefun-diff/1 old='); ops.push(G,b,G,c,Y,Fl,S,b);emitHdr(' new='); ops.push(G,b,G,d,Y,Fl,S,b);emitHdr(' hunks='); ops.push(G,b,G,i,Y,Fl,S,b);emitHdr(' deleted='); ops.push(G,b,P,Qw,Y,Fl,S,b);emitHdr(' inserted='); ops.push(G,b,P,Qx,Y,Fl,S,b);ops.push(G,b,C,10,S8,0,IC,b,G,i,EZ,UV,G,b,Q,QA,X,E,C0,S,o,P,qr,L32,0,G,e,C,3,A,LT,G,e,C0,GT,AN,UV,G,e,C,3,G,e,C,3,LT,Z,S,o,G,l,S,s,G,q,G,o,SH2,G,s,S32,0,GB1,o,S,u,BL,G,u,C0,LT,BF1,
+G,s,G,j,G,s,A,C1,B,L8,0,C,10,EQ,U,I,C,2,H,C1,E,B,S,s,BL,G,s,C0,LT,BF1,G,j,G,s,A,L8,0,C,10,EQ,BF1,DC,s,R0,EE,IC,s,G,q,G,u,SH2,G,s,S32,0,DC,u,R0,EE,E,C0,S,p,G,f,C0,GT,UV,P,qw,GB1,i,SH2,L32,0,S,x,LA,qr,x,LA,qt,x,A,C,3,A,G,e,G,g,A,GT,UV,G,f,C,3,G,f,C,3,LT,Z,S,p,G,m,S,s,G,r,G,s,S32,0,C1,S,u,BL,G,u,G,p,GT,BF1,BL,G,s,G,n,GEU,BF1,G,j,G,s,A,L8,0,C,10,EQ,UV,IC,s,R,2,E,IC,s,R0,EE,G,r,G,u,SH2,G,s,S32,0,IC,u,R0,EE,EE,C0,S,v,BL,G,v,G,i,GE,BF1,LA,qv,v,S,w,LA,qw,v,S,x,LA,qr,w,S,y,LA,qs,w,S,z,LA,qr,x,S,_a,LA,qs,x,S,_b,LA,qt,x,S,_c,LA,qu,x,S,_d,G,y,C,3,GT,U,I,G,y,C,3,B,H,C0,E,S,_e,G,z,G,y,G,_e,B,B,S,_f,G,c,G,_a,G,_c,A,B,S,_g,G,_g,C,3,G,_g,C,3,LT,Z,S,_h,G,_a,G,_c,A,G,_h,A,S,_i,
+G,_b,G,_d,A,G,_h,A,S,_j,);emitHdr('@ ');ops.push(G,b,GA1,_e,Y,Fl,S,b,G,b,C,32,S8,0,IC,b,G,b,G,_i,G,_e,B,Y,Fl,S,b,G,b,C,32,S8,0,IC,b,G,b,GA1,_f,Y,Fl,S,b,G,b,C,32,S8,0,IC,b,G,b,G,_j,G,_f,B,Y,Fl,S,b,G,b,C,10,S8,0,IC,b,G,_e,S,_k,G,w,S,_l,BL,G,_l,G,x,GT,BF1,LA,qr,_l,S,_m,LA,qs,_l,S,_n,LA,qt,_l,S,_o,LA,qu,_l,S,_p,BL,G,_k,G,_m,GE,BF1,);emitPushOld(61);ops.push(G,_k,C1,A,S,_k,R0,EE,C0,S,u,BL,G,u,G,_o,GE,BF1,G,_m,G,u,A,S,_k);emitPushOld(45);ops.push(G,u,C1,A,S,u,R0,EE,C0,S,u,BL,G,u,G,_p,GE,BF1,G,_n,G,u,A,G,e,B,S,_q,G,b,G,k,G,_t,G,_q,SH2,T,_u,L32,0,G,_u,L32,4,C,43,Y,Fm,S,b,IC,u,R0,EE,G,_m,G,_o,A,S,_k,IC,_l,R0,EE,BL,G,_k,G,_i,GE,BF1,);emitPushOld(61);ops.push(G,_k,C1,A,S,_k,R0,EE,
+IC,v,R0,EE,G,b,Q,QA,);
+return ops;});
+def(Fo,[],[I],()=>[Y,Fe,P,qi,P,qk,EQ,P,qj,P,ql,EQ,AN,UV,C0,Q,qm,C0,Q,qn,C0,Q,Qy,C0,Q,Qw,C0,Q,Qx,P,qe,Q,qx,Y,Fn,P,QA,P,Qz,B,X,E,Y,Fg,P,qm,EZ,P,qn,EZ,OR,UV,P,qr,P,qg,S32,0,P,qs,P,qg,S32,0,P,qt,P,qm,S32,0,P,qu,P,qn,S32,0,P,qv,C0,S32,0,P,qw,C0,S32,0,C1,Q,Qv,C1,Q,Qy,P,qm,Q,Qw,P,qn,Q,Qx,Y,Fn,P,QA,P,Qz,B,X,E,Y,Fh,D,Y,Fj,Y,Fk,Y,Fn,P,QA,P,Qz,B,]);
+def(Fp,[],[I],()=>[P,Qz]);
+def(Fq,[],[I],()=>[P,QB]);
+def(Fr,[I,I],[I],(loc)=>{
+const a=0,b=1,c=loc();
+return [BL,G,a,G,b,GEU,BF1,G,a,L8,0,T,c,C,32,EQ,G,c,C,9,EQ,OR,G,c,C,10,EQ,OR,G,c,C,13,EQ,OR,EZ,BF1,IC,a,R0,EE,G,a,];});
+def(Fs,[I,I],[I],(loc)=>{
+const a=0,b=1,c=loc();
+return [G,a,G,b,GEU,UV,CM1,X,E,G,a,L8,0,C,34,NE,UV,CM1,X,E,IC,a,BL,G,a,G,b,GEU,UV,CM1,X,E,G,a,L8,0,S,c,G,c,C,34,EQ,UV,GA1,a,X,E,G,c,C,92,EQ,UV,GA1,a,G,b,GEU,UV,CM1,X,E,G,a,C,2,A,S,a,R,1,E,G,c,C,32,LU,G,c,C,127,GU,OR,UV,CM1,X,E,IC,a,R0,EE,CM1,];});
+def(Ft,[I,I,I],[I],(loc)=>{
+const a=0,b=1,c=2;
+const d=loc(),e=loc(),f=loc(),g=loc(),h=loc(),i=loc(),j=loc(),k=loc();
+const l=loc(W),m=loc(W),n=loc(W),o=loc(W);
+const ops=[
+G,a,G,b,GEU,UV,CM1,X,E,G,a,L8,0,C,34,NE,UV,CM1,X,E,IC,a,G,c,S,d,G,b,C,16,B,S,e,C,34,VS8,S,l,C,92,VS8,S,m,C,32,VS8,S,n,];
+const pushHex=(chL,outL)=>{
+ops.push(G,chL,C,48,B,T,outL,C,9,LEU,UV,H,G,chL,C,32,OR,C,87,B,T,outL,C,10,LU,G,outL,C,15,GU,OR,UV,CM1,X,EE,);};
+const pushHandleEsc=()=>{
+ops.push(G,a,C1,A,G,b,GEU,UV,CM1,X,E,GA1,a,L8,0,S,i,G,i,C,110,EQ,UV,G,d,C,10,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,114,EQ,UV,G,d,C,13,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,34,EQ,UV,G,d,C,34,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,92,EQ,UV,G,d,C,92,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,116,EQ,UV,G,d,C,9,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,98,EQ,UV,G,d,C,8,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,102,EQ,UV,G,d,C,12,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,47,EQ,UV,G,d,C,47,S8,0,G,a,C,2,A,S,a,IC,d,H,G,i,C,117,EQ,UV,G,a,C,5,A,G,b,GEU,UV,CM1,X,E,G,a,L8,2,C,48,NE,G,a,L8,3,C,48,NE,OR,UV,CM1,X,E,G,a,L8,4,S,h,);pushHex(h,j);ops.push(G,j,C,7,GU,UV,CM1,X,E,G,a,L8,5,S,h);pushHex(h,k);ops.push(G,d,G,j,C,4,SL,G,k,OR,S8,0,G,a,C,6,A,S,a,IC,d,
+H,CM1,X,EE,EE,EE,EE,E,);};ops.push(K,V,O,V,G,a,G,e,GT,BF1,G,a,VL,0,T,o,G,o,G,l,VE8,G,o,G,m,VE8,VOR,G,o,G,n,VL8,VOR,VBM,T,f,EZ,UV,G,d,G,o,VS,0,G,a,C,16,A,S,a,G,d,C,16,A,S,d,R,1,E,G,f,TZ,T,g,UV,G,d,G,o,VS,0,G,a,G,g,A,S,a,G,d,G,g,A,S,d,E,G,a,L8,0,S,h,G,h,C,34,EQ,UV,GA1,a,Q,QC,G,d,G,c,B,X,E,G,h,C,92,NE,UV,CM1,X,E,);pushHandleEsc();ops.push(R,0,EE,BL,G,a,G,b,GEU,UV,CM1,X,E,G,a,L8,0,S,h,G,h,C,34,EQ,UV,GA1,a,Q,QC,G,d,G,c,B,X,E,G,h,C,92,EQ,UV,);pushHandleEsc();ops.push(R,1,E,G,h,C,32,LU,G,h,C,127,GU,OR,UV,CM1,X,E,G,d,G,h,S8,0,IC,a,IC,d,R0,EE,CM1,);
+return ops;});
+def(Fu,[I,I,I],[I],(loc)=>{
+const a=0,b=1,c=2,d=loc(),e=loc(),f=loc(),g=loc(),h=loc(),i=loc(),j=loc();
+const k=loc(W),l=loc(W),m=loc(W),n=loc(W);
+const ops=[
+G,c,C,34,S8,0,IC,c,G,a,G,b,A,T,d,C,16,B,S,e,C,34,VS8,S,k,C,92,VS8,S,l,C,32,VS8,S,m,];
+const pushEsc=()=>{
+ops.push(G,h,C,10,EQ,UV,G,c,C,92,S8,0,G,c,C,110,S8,1,G,c,C,2,A,S,c,H,G,h,C,34,EQ,UV,G,c,C,92,S8,0,G,c,C,34,S8,1,G,c,C,2,A,S,c,H,G,h,C,92,EQ,UV,G,c,C,92,S8,0,G,c,C,92,S8,1,G,c,C,2,A,S,c,H,G,h,C,13,EQ,UV,G,c,C,92,S8,0,G,c,C,114,S8,1,G,c,C,2,A,S,c,H,G,h,C,9,EQ,UV,G,c,C,92,S8,0,G,c,C,116,S8,1,G,c,C,2,A,S,c,H,G,h,C,8,EQ,UV,G,c,C,92,S8,0,G,c,C,98,S8,1,G,c,C,2,A,S,c,H,G,h,C,12,EQ,UV,G,c,C,92,S8,0,G,c,C,102,S8,1,G,c,C,2,A,S,c,H,G,c,C,92,S8,0,G,c,C,117,S8,1,G,c,C,48,S8,2,G,c,C,48,S8,3,G,h,C,4,SR,C,48,A,S,i,G,h,C,15,AN,T,j,C,10,LU,U,I,G,j,C,48,A,H,G,j,C,87,A,E,S,j,G,c,G,i,S8,4,G,c,G,j,S8,5,G,c,C,6,A,S,c,EE,EE,EE,E,);};ops.push(K,V,O,V,G,a,G,e,GT,BF1,G,a,VL,0,T,n,G,n,G,k,VE8,G,n,G,l,VE8,VOR,G,n,G,m,VL8,VOR,VBM,T,f,EZ,UV,G,c,G,n,VS,0,G,a,C,16,A,S,a,G,c,C,16,A,S,c,R,1,E,G,f,TZ,T,g,UV,
+G,c,G,n,VS,0,G,a,G,g,A,S,a,G,c,G,g,A,S,c,E,G,a,L8,0,S,h,IC,a,);pushEsc();ops.push(R,0,EE,BL,G,a,G,d,GEU,BF1,G,a,L8,0,S,h,IC,a,G,h,C,34,EQ,G,h,C,92,EQ,OR,G,h,C,32,LU,OR,UV,);pushEsc();ops.push(H,G,c,G,h,S8,0,IC,c,E,R0,EE,G,c,C,34,S8,0,GA1,c,);
+return ops;});
+def(Fv,[I,I,I],[I],()=>[G,0,G,1,GEU,UV,CM1,X,E,G,0,L8,0,G,2,NE,UV,CM1,X,E,GA1,0,G,1,Y,Fr,]);
+def(Fw,[],[I],(loc)=>{
+const a=loc(),b=loc(),c=loc(),d=loc(),e=loc();
+const f=loc(),g=loc(),h=loc(),i=loc(),j=loc(),k=loc(),l=loc();
+const m=loc(),n=loc(),o=loc(),p=loc(),q=loc(),r=loc(),s=loc(),u=loc(),v=loc();
+const ops=[
+P,qf,S,a,C0,G,a,Y,Fr,S,b,];
+const expect=(ch)=>ops.push(G,b,G,a,C,ch,Y,Fv,T,b,C0,LT,UV,CM1,X,E);
+expect(91);ops.push(G,a,C,31,A,C,-16,AN,T,c,Q,QB,G,c,C,1024,A,Y,Fa,G,c,S,d,G,d,C,91,S8,0,IC,d,G,b,G,a,LU,UV,G,b,L8,0,C,93,EQ,UV,GA1,b,G,a,Y,Fr,G,a,NE,UV,CM1,X,E,G,d,C,93,S8,0,GA1,d,G,c,B,X,EE,C0,S,e,BL,G,e,C0,GT,UV,G,d,C,16,A,Y,Fa,G,d,C,44,S8,0,IC,d,E,);expect(123);ops.push(C,0,S,f,CM1,S,g,CM1,S,h,BL,G,b,G,a,GEU,UV,CM1,X,E,G,b,L8,0,C,125,EQ,BF1,G,b,C,7,A,G,a,LEU,U,I,G,b,U32,0,C,0x706e6922,EQ,G,b,U32,3,C,0x22747570,EQ,AN,H,C0,E,UV,G,f,UV,CM1,X,E,C1,S,f,G,b,C,7,A,G,a,Y,Fr,S,b,);expect(58); expect(123);ops.push(G,d,C,31,A,C,-16,AN,S,k,C0,S,l,BL,G,b,G,a,GEU,UV,CM1,X,E,G,b,L8,0,C,125,EQ,BF1,G,b,C,5,A,G,a,GU,UV,CM1,X,E,G,b,L8,4,C,34,NE,UV,CM1,X,E,G,b,U32,0,C,0x646c6f22,EQ,UV,C1,S,u,H,G,b,U32,0,C,0x77656e22,EQ,UV,C0,S,u,
+H,CM1,X,EE,G,u,UV,G,g,C0,GE,UV,CM1,X,E,H,G,h,C0,GE,UV,CM1,X,EE,G,b,C,5,A,G,a,Y,Fr,S,b,);expect(58);ops.push(G,g,C0,LT,G,h,C0,LT,AN,UV,G,k,G,a,G,b,B,A,C,64,A,Y,Fa,G,b,G,a,G,k,Y,Ft,T,l,C0,LT,UV,CM1,X,E,G,u,UV,G,k,S,i,G,l,S,g,H,G,k,S,j,G,l,S,h,E,H,G,k,G,l,A,C,31,A,C,-16,AN,S,v,G,v,G,a,G,b,B,A,C,64,A,Y,Fa,G,b,G,a,G,v,Y,Ft,T,q,C0,LT,UV,CM1,X,E,G,u,UV,G,v,S,i,G,q,S,g,H,G,v,S,j,G,q,S,h,EE,P,QC,G,a,Y,Fr,S,b,G,b,G,a,GEU,UV,CM1,X,E,G,b,L8,0,C,44,EQ,UV,GA1,b,G,a,Y,Fr,S,b,R,1,E,R,1,EE,);expect(125);ops.push(H,G,b,C,4,A,G,a,LEU,U,I,G,b,U32,0,C,0x22646922,EQ,H,C0,E,UV,G,b,C,4,A,G,a,Y,Fr,S,b,H,G,b,C,7,A,G,a,LEU,U,I,G,b,U32,0,C,0x6f726722,EQ,G,b,U32,3,C,0x2270756f,EQ,AN,H,C0,E,UV,G,b,C,7,A,G,a,Y,Fr,S,b,H,CM1,X,EE,);expect(58);ops.push(G,b,G,a,GEU,UV,CM1,X,E,
+G,b,L8,0,C,34,EQ,UV,G,b,G,a,Y,Fs,T,b,C0,LT,UV,CM1,X,E,H,G,b,L8,0,C,45,EQ,UV,IC,b,E,G,b,G,a,GEU,UV,CM1,X,E,G,b,L8,0,T,s,C,48,LU,G,s,C,57,GU,OR,UV,CM1,X,E,BL,G,b,G,a,GEU,BF1,G,b,L8,0,T,s,C,48,LU,G,s,C,57,GU,OR,BF1,IC,b,R0,EE,E,G,b,G,a,Y,Fr,S,b,E,G,b,G,a,GEU,UV,CM1,X,E,G,b,L8,0,C,44,EQ,UV,GA1,b,G,a,Y,Fr,S,b,R,1,E,R,1,EE,);expect(125);ops.push(G,f,EZ,G,g,C0,LT,OR,G,h,C0,LT,OR,UV,CM1,X,E,G,i,Q,qa,G,g,Q,qb,G,j,Q,qc,G,h,Q,qd,G,i,G,g,A,T,v,G,j,G,h,A,T,p,G,v,G,p,G,v,G,p,GU,Z,C,31,A,C,-16,AN,Q,qe,Y,Fo,S,m,P,Qz,S,n,P,QA,S,o,G,d,G,m,C,6,M,A,C,64,A,G,n,LEU,UV,G,n,G,m,G,d,Y,Fu,S,d,H,G,o,C,31,A,C,-16,AN,S,p,G,p,G,m,C,6,M,A,C,64,A,Y,Fa,G,n,G,m,G,p,Y,Fu,S,q,G,q,G,p,B,S,r,G,d,G,p,G,r,MCP,G,d,G,r,A,S,d,E,IC,e,G,b,G,a,LU,UV,
+G,b,L8,0,C,44,EQ,UV,GA1,b,G,a,Y,Fr,S,b,R,2,EE,R,1,EE,);expect(93);ops.push(G,b,G,a,NE,UV,CM1,X,E,G,d,C,16,A,Y,Fa,G,d,C,93,S8,0,GA1,d,G,c,B,);
+return ops;});
+const out=new Uint8Array(32768);
+let p=0;
+out[p++]=0x00; out[p++]=0x61; out[p++]=0x73; out[p++]=0x6d;out[p++]=0x01; out[p++]=0x00; out[p++]=0x00; out[p++]=0x00;
+const beginSec=(id)=>{ out[p++]=id; const lp=p; p += 5; return lp; };
+const endSec=(lp)=>{
+let len=p - (lp + 5);
+for (let i=0; i < 4; i++) { out[lp + i]=(len & 0x7f) | 0x80; len >>>= 7; }
+out[lp + 4]=len & 0x7f;};
+let lp=beginSec(1);
+p=writeUleb(out,p,types.length);
+for (let i=0; i < types.length; i++) {
+const t=types[i];
+out[p++]=0x60; p=writeUleb(out,p,t.params.length);
+for (let j=0; j < t.params.length; j++) out[p++]=t.params[j];
+p=writeUleb(out,p,t.results.length);
+for (let j=0; j < t.results.length; j++) out[p++]=t.results[j];
+}endSec(lp);lp=beginSec(3);p=writeUleb(out,p,funcs.length);
+for (let i=0; i < funcs.length; i++) p=writeUleb(out,p,funcs[i].typeIdx);
+endSec(lp);lp=beginSec(5);out[p++]=0x01; out[p++]=0x00; p=writeUleb(out,p,320);endSec(lp);lp=beginSec(6);p=writeUleb(out,p,gc);
+for (let i=0; i < gc; i++) { out[p++]=I; out[p++]=0x01; out[p++]=C; out[p++]=0x00; out[p++]=E; }
+endSec(lp);
+const exports=[
+['memory',0x02,0],['prepareInput',0x00,Fb],['prepareBatch',0x00,Fc],['solveAscii',0x00,Fo],['solveBatchJson',0x00,Fw],['getOutBase',0x00,Fp],['getBatchOutBase',0x00,Fq],];lp=beginSec(7);p=writeUleb(out,p,exports.length);
+for (let i=0; i < exports.length; i++) {
+const [name,kind,idx]=exports[i];
+p=writeUleb(out,p,name.length);
+for (let j=0; j < name.length; j++) out[p++]=name.charCodeAt(j);
+out[p++]=kind; p=writeUleb(out,p,idx);}endSec(lp);out[p++]=12; out[p++]=1; out[p++]=1;lp=beginSec(10);p=writeUleb(out,p,funcs.length);
+for (let i=0; i < funcs.length; i++) {
+const fn=funcs[i],locs=fn.locals,bodyStart=p + 5;
+let bp=bodyStart,grpCount=0;
+const gCounts=[],gTypes=[];
+for (let j=0; j < locs.length; j++) {
+const t=locs[j];
+if (grpCount > 0 && gTypes[grpCount - 1] === t) gCounts[grpCount - 1]++;else { gCounts[grpCount]=1; gTypes[grpCount]=t; grpCount++; }}bp=writeUleb(out,bp,grpCount);
+for (let j=0; j < grpCount; j++) { bp=writeUleb(out,bp,gCounts[j]); out[bp++]=gTypes[j]; }
+bp=encodeBody(fn.ops,out,bp);
+let len=bp - bodyStart;
+for (let j=0; j < 4; j++) { out[p + j]=(len & 0x7f) | 0x80; len >>>= 7; }
+out[p + 4]=len & 0x7f;p=bp;}endSec(lp);lp=beginSec(11);out[p++]=1; out[p++]=0x01;
+p = writeUleb(out, p, HDR_STR.length);
+for (let i = 0; i < HDR_STR.length; i++) out[p++] = HDR_STR.charCodeAt(i);
+endSec(lp);
+const mod=new WebAssembly.Module(out.subarray(0,p));
+return new WebAssembly.Instance(mod).exports;}
