@@ -1,5 +1,4 @@
 import { closeSync, fstatSync, openSync, readSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { buildDiffWasm } from './wasm-core.js';
 
 export const FORMAT = 'makefun-diff/1';
@@ -8,7 +7,6 @@ export const CONTEXT = 3;
 const wasm = buildDiffWasm();
 let memBuf = Buffer.from(wasm.memory.buffer);
 let utf16Mod = null;
-const req = createRequire(import.meta.url);
 
 function countLinesStr(str) {
   let cnt = 0;
@@ -43,12 +41,17 @@ export function diffPatch(input) {
     if (oLen > 0) memBuf.write(oldStr, 0, oLen, 'latin1');
     if (nLen > 0) memBuf.write(newStr, nBase, nLen, 'latin1');
     const outLen = wasm.solveAscii();
-    if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
-    const outBase = wasm.getOutBase();
-    return memBuf.toString('latin1', outBase, outBase + outLen);
+    if (outLen >= 0) {
+      if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+      const outBase = wasm.getOutBase();
+      return memBuf.toString('latin1', outBase, outBase + outLen);
+    }
   }
 
-  if (!utf16Mod) utf16Mod = req('./utf16-fallback.cjs');
+  if (!utf16Mod) {
+    const { createRequire } = process.getBuiltinModule('node:module');
+    utf16Mod = createRequire(import.meta.url)('./utf16-fallback.cjs');
+  }
   return utf16Mod.diffPatchUtf16(oldStr, newStr);
 }
 
@@ -73,7 +76,7 @@ export function runCasesFile(inputPath, outputPath) {
   if (outLen >= 0) {
     if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
     const outBase = wasm.getBatchOutBase();
-    writeFileSync(outputPath, new Uint8Array(wasm.memory.buffer, outBase, outLen));
+    writeFileSync(outputPath, memBuf.subarray(outBase, outBase + outLen));
     return;
   }
 
