@@ -1,5 +1,10 @@
+import { buildDiffWasm } from './wasm-core.js';
+
 export const FORMAT = 'makefun-diff/1';
 export const CONTEXT = 3;
+
+const wasm = buildDiffWasm();
+let memBuf = Buffer.from(wasm.memory.buffer);
 
 const KEEP = 0;
 const DELETE = 1;
@@ -10,32 +15,31 @@ const B_MASK = B_STEP - 1;
 const GRID_N = 64;
 const GRID_S = GRID_N + 1;
 
-// Reusable module-level scratch buffers (completely overwritten/zeroed per call; zero cross-case state)
-let oStarts = new Int32Array(45000);
-let oEnds = new Int32Array(45000);
-let oHash = new Int32Array(45000);
-let nStarts = new Int32Array(45000);
-let nEnds = new Int32Array(45000);
-let nHash = new Int32Array(45000);
+// Lazy scratch buffers for UTF-16 fallback (allocated only if non-ASCII input is seen)
+let oStarts = new Int32Array(0);
+let oEnds = new Int32Array(0);
+let oHash = new Int32Array(0);
+let nStarts = new Int32Array(0);
+let nEnds = new Int32Array(0);
 
-let buckets = new Int32Array(131072);
-let A = new Int32Array(45005);
-let B = new Int32Array(45005);
-let cntA = new Int32Array(45000);
-let cntB = new Int32Array(45000);
-let posB = new Int32Array(45000);
-let seen = new Int32Array(45000);
-let remDel = new Int32Array(45005);
-let remIns = new Int32Array(45005);
+let buckets = new Int32Array(0);
+let A = new Int32Array(0);
+let B = new Int32Array(0);
+let cntA = new Int32Array(0);
+let cntB = new Int32Array(0);
+let posB = new Int32Array(0);
+let seen = new Int32Array(0);
+let remDel = new Int32Array(0);
+let remIns = new Int32Array(0);
 
-let tailsVal = new Int32Array(45005);
-let tailsA = new Int32Array(45005);
-let prevIdx = new Int32Array(45005);
-let ancA = new Int32Array(45005);
-let ancB = new Int32Array(45005);
-let isUniq = new Uint8Array(45000);
-let inLIS = new Uint8Array(45005);
-let usedLIS = new Uint8Array(45005);
+let tailsVal = new Int32Array(0);
+let tailsA = new Int32Array(0);
+let prevIdx = new Int32Array(0);
+let ancA = new Int32Array(0);
+let ancB = new Int32Array(0);
+let isUniq = new Uint8Array(0);
+let inLIS = new Uint8Array(0);
+let usedLIS = new Uint8Array(0);
 const grid64 = new Int32Array(GRID_S * GRID_S);
 
 let Vp = new Int32Array(8192);
@@ -48,10 +52,16 @@ let revCount = new Int32Array(16384);
 
 function ensureNM(nCap, mCap) {
   if (nCap > oStarts.length) {
-    const c = nCap + 1024;
+    const c = Math.max(nCap + 1024, 4096);
+    const oldOS = oStarts;
+    const oldOE = oEnds;
     oStarts = new Int32Array(c);
     oEnds = new Int32Array(c);
     oHash = new Int32Array(c);
+    if (oldOS.length > 0) {
+      oStarts.set(oldOS);
+      oEnds.set(oldOE);
+    }
     A = new Int32Array(c + 4);
     cntA = new Int32Array(c);
     cntB = new Int32Array(c);
@@ -63,16 +73,21 @@ function ensureNM(nCap, mCap) {
     inLIS = new Uint8Array(c + 4);
   }
   if (mCap > nStarts.length) {
-    const c = mCap + 1024;
+    const c = Math.max(mCap + 1024, 4096);
+    const oldNS = nStarts;
+    const oldNE = nEnds;
     nStarts = new Int32Array(c);
     nEnds = new Int32Array(c);
-    nHash = new Int32Array(c);
+    if (oldNS.length > 0) {
+      nStarts.set(oldNS);
+      nEnds.set(oldNE);
+    }
     B = new Int32Array(c + 4);
     remIns = new Int32Array(c + 4);
   }
   const minC = nCap < mCap ? nCap : mCap;
   if (minC + 4 > tailsVal.length) {
-    const c = minC + 1024;
+    const c = Math.max(minC + 1024, 4096);
     tailsVal = new Int32Array(c);
     tailsA = new Int32Array(c);
     ancA = new Int32Array(c);
@@ -94,205 +109,8 @@ function countLinesStr(str) {
   return cnt;
 }
 
-function trimAndScanAscii(oBuf, nBuf, oLen, nLen) {
-  // 1. Common prefix
-  let oStart = 0;
-  let nStart = 0;
-  let prefix = 0;
-  while (oStart < oLen && nStart < nLen) {
-    const oNl = oBuf.indexOf(10, oStart);
-    const nNl = nBuf.indexOf(10, nStart);
-    const oEndL = oNl === -1 ? oLen : oNl + 1;
-    const nEndL = nNl === -1 ? nLen : nNl + 1;
-    const len = oEndL - oStart;
-    if (len !== nEndL - nStart) break;
-    let k = 0;
-    for (; k + 4 <= len; k += 4) {
-      if (
-        oBuf[oStart + k] !== nBuf[nStart + k] ||
-        oBuf[oStart + k + 1] !== nBuf[nStart + k + 1] ||
-        oBuf[oStart + k + 2] !== nBuf[nStart + k + 2] ||
-        oBuf[oStart + k + 3] !== nBuf[nStart + k + 3]
-      ) {
-        break;
-      }
-    }
-    if (k + 4 > len) {
-      while (k < len && oBuf[oStart + k] === nBuf[nStart + k]) k++;
-    }
-    if (k !== len) break;
-    oStart = oEndL;
-    nStart = nEndL;
-    prefix++;
-  }
-
-  // 2. Common suffix
-  let oEnd = oLen;
-  let nEnd = nLen;
-  let suffix = 0;
-  while (oEnd > oStart && nEnd > nStart) {
-    const oS = oEnd - (oBuf[oEnd - 1] === 10 ? 2 : 1);
-    const nS = nEnd - (nBuf[nEnd - 1] === 10 ? 2 : 1);
-    const oNl = oS >= oStart ? oBuf.lastIndexOf(10, oS) : -1;
-    const nNl = nS >= nStart ? nBuf.lastIndexOf(10, nS) : -1;
-    const oL = oNl < oStart ? oStart : oNl + 1;
-    const nL = nNl < nStart ? nStart : nNl + 1;
-    const len = oEnd - oL;
-    if (len !== nEnd - nL) break;
-    let k = 0;
-    for (; k + 4 <= len; k += 4) {
-      if (
-        oBuf[oL + k] !== nBuf[nL + k] ||
-        oBuf[oL + k + 1] !== nBuf[nL + k + 1] ||
-        oBuf[oL + k + 2] !== nBuf[nL + k + 2] ||
-        oBuf[oL + k + 3] !== nBuf[nL + k + 3]
-      ) {
-        break;
-      }
-    }
-    if (k + 4 > len) {
-      while (k < len && oBuf[oL + k] === nBuf[nL + k]) k++;
-    }
-    if (k !== len) break;
-    oEnd = oL;
-    nEnd = nL;
-    suffix++;
-  }
-
-  // 3. Single-pass SIMD indexOf(10) line offset scan + 4-byte packed FNV-1a hash
-  let n = 0;
-  let p = oStart;
-  while (p < oEnd) {
-    const nl = oBuf.indexOf(10, p);
-    const e = nl === -1 || nl >= oEnd ? oEnd : nl + 1;
-    let h = 2166136261 | 0;
-    let k = p;
-    for (; k + 4 <= e; k += 4) {
-      const w = oBuf[k] | (oBuf[k + 1] << 8) | (oBuf[k + 2] << 16) | (oBuf[k + 3] << 24);
-      h = Math.imul(h ^ w, 16777619);
-    }
-    for (; k < e; k++) h = Math.imul(h ^ oBuf[k], 16777619);
-    if (n === oStarts.length) ensureNM(n * 2, nStarts.length);
-    oStarts[n] = p;
-    oEnds[n] = e;
-    oHash[n] = h;
-    n++;
-    p = e;
-  }
-
-  let m = 0;
-  p = nStart;
-  while (p < nEnd) {
-    const nl = nBuf.indexOf(10, p);
-    const e = nl === -1 || nl >= nEnd ? nEnd : nl + 1;
-    let h = 2166136261 | 0;
-    let k = p;
-    for (; k + 4 <= e; k += 4) {
-      const w = nBuf[k] | (nBuf[k + 1] << 8) | (nBuf[k + 2] << 16) | (nBuf[k + 3] << 24);
-      h = Math.imul(h ^ w, 16777619);
-    }
-    for (; k < e; k++) h = Math.imul(h ^ nBuf[k], 16777619);
-    if (m === nStarts.length) ensureNM(oStarts.length, m * 2);
-    nStarts[m] = p;
-    nEnds[m] = e;
-    nHash[m] = h;
-    m++;
-    p = e;
-  }
-
-  ensureNM(n + 4, m + 4);
-  return { oStart, nStart, oEnd, nEnd, prefix, suffix, n, m };
-}
-
-function internAscii(oBuf, nBuf, n, m) {
-  let hCap = 16;
-  while (hCap < n * 2) hCap <<= 1;
-  if (hCap > buckets.length) buckets = new Int32Array(hCap);
-  buckets.fill(0, 0, hCap);
-  const hMask = hCap - 1;
-  cntA.fill(0, 0, n);
-  cntB.fill(0, 0, n);
-
-  for (let i = 0; i < n; i++) {
-    const st = oStarts[i];
-    const len = oEnds[i] - st;
-    const hi = oHash[i];
-    let slot = hi & hMask;
-    while (true) {
-      const b = buckets[slot];
-      if (b === 0) {
-        buckets[slot] = i + 1;
-        A[i] = i;
-        cntA[i] = 1;
-        break;
-      }
-      const rep = b - 1;
-      if (oHash[rep] === hi && oEnds[rep] - oStarts[rep] === len) {
-        const rs = oStarts[rep];
-        let k = 0;
-        for (; k + 4 <= len; k += 4) {
-          if (
-            oBuf[rs + k] !== oBuf[st + k] ||
-            oBuf[rs + k + 1] !== oBuf[st + k + 1] ||
-            oBuf[rs + k + 2] !== oBuf[st + k + 2] ||
-            oBuf[rs + k + 3] !== oBuf[st + k + 3]
-          ) {
-            break;
-          }
-        }
-        if (k + 4 > len) {
-          while (k < len && oBuf[rs + k] === oBuf[st + k]) k++;
-        }
-        if (k === len) {
-          A[i] = rep;
-          cntA[rep]++;
-          break;
-        }
-      }
-      slot = (slot + 1) & hMask;
-    }
-  }
-
-  for (let i = 0; i < m; i++) {
-    const st = nStarts[i];
-    const len = nEnds[i] - st;
-    const hi = nHash[i];
-    let slot = hi & hMask;
-    let found = -3;
-    while (true) {
-      const b = buckets[slot];
-      if (b === 0) break;
-      const rep = b - 1;
-      if (oHash[rep] === hi && oEnds[rep] - oStarts[rep] === len) {
-        const rs = oStarts[rep];
-        let k = 0;
-        for (; k + 4 <= len; k += 4) {
-          if (
-            oBuf[rs + k] !== nBuf[st + k] ||
-            oBuf[rs + k + 1] !== nBuf[st + k + 1] ||
-            oBuf[rs + k + 2] !== nBuf[st + k + 2] ||
-            oBuf[rs + k + 3] !== nBuf[st + k + 3]
-          ) {
-            break;
-          }
-        }
-        if (k + 4 > len) {
-          while (k < len && oBuf[rs + k] === nBuf[st + k]) k++;
-        }
-        if (k === len) {
-          found = rep;
-          cntB[rep]++;
-          posB[rep] = i;
-          break;
-        }
-      }
-      slot = (slot + 1) & hMask;
-    }
-    B[i] = found;
-  }
-}
-
 function trimAndScanUtf16(oldStr, newStr, oLen, nLen) {
+  if (oStarts.length === 0) ensureNM(4096, 4096);
   let oStart = 0;
   let nStart = 0;
   let prefix = 0;
@@ -964,13 +782,18 @@ export function diffPatch(input) {
     return `${FORMAT} old=${cnt} new=${cnt} hunks=0 deleted=0 inserted=0\n`;
   }
 
-  const oBuf = Buffer.from(oldStr);
-  const nBuf = Buffer.from(newStr);
-  const isAscii = oBuf.length === oLen && nBuf.length === nLen;
+  if (Buffer.byteLength(oldStr) === oLen && Buffer.byteLength(newStr) === nLen) {
+    const nBase = wasm.prepareInput(oLen, nLen);
+    if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+    if (oLen > 0) memBuf.write(oldStr, 0, oLen, 'latin1');
+    if (nLen > 0) memBuf.write(newStr, nBase, nLen, 'latin1');
+    const outLen = wasm.solveAscii();
+    if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+    const outBase = wasm.getOutBase();
+    return memBuf.toString('latin1', outBase, outBase + outLen);
+  }
 
-  const { oStart, oEnd, prefix, suffix, n, m } = isAscii
-    ? trimAndScanAscii(oBuf, nBuf, oLen, nLen)
-    : trimAndScanUtf16(oldStr, newStr, oLen, nLen);
+  const { oStart, oEnd, prefix, suffix, n, m } = trimAndScanUtf16(oldStr, newStr, oLen, nLen);
 
   const totalOld = prefix + n + suffix;
   const totalNew = prefix + m + suffix;
@@ -1029,8 +852,7 @@ export function diffPatch(input) {
     return out.join('');
   }
 
-  if (isAscii) internAscii(oBuf, nBuf, n, m);
-  else internUtf16(oldStr, newStr, n, m);
+  internUtf16(oldStr, newStr, n, m);
 
   const U = buildBoundsAndUB(n, m);
   const fwd = myersForward(n, m, U);
