@@ -1,8 +1,9 @@
-// Hand-authored WebAssembly bytecode builder for zero-copy ASCII Myers diff & patch construction.
-// Compiles synchronously via WebAssembly.Module in < 0.5 ms with zero external dependencies.
+// Hand-authored WebAssembly SIMD128 bytecode builder for zero-JSON batch diff & patch construction.
+// Compiles synchronously via WebAssembly.Module with zero external dependencies.
 
 const I32 = 0x7f;
 const I64 = 0x7e;
+const V128 = 0x7b;
 const VOID = 0x40;
 const KEEP = 0;
 const DELETE = 1;
@@ -10,7 +11,6 @@ const INSERT = 2;
 
 const OP = {
   unreachable: 0x00,
-  nop: 0x01,
   block: 0x02,
   loop: 0x03,
   if: 0x04,
@@ -51,13 +51,12 @@ const OP = {
   i64_eqz: 0x50,
   i64_eq: 0x51,
   i64_ne: 0x52,
-  i64_lt_u: 0x54,
-  i64_popcnt: 0x7b, // wait: i64.ctz=0x7a, i64.popcnt=0x7b? CHECK: 0x79=clz, 0x7a=ctz, 0x7b=popcnt!
-  i64_ctz: 0x7a,
+  i32_clz: 0x67,
+  i32_ctz: 0x68,
+  i32_popcnt: 0x69,
   i32_add: 0x6a,
   i32_sub: 0x6b,
   i32_mul: 0x6c,
-  i32_div_s: 0x6d,
   i32_div_u: 0x6e,
   i32_rem_u: 0x70,
   i32_and: 0x71,
@@ -66,7 +65,7 @@ const OP = {
   i32_shl: 0x74,
   i32_shr_s: 0x75,
   i32_shr_u: 0x76,
-  i64_add: 0x7c,
+  i64_ctz: 0x7a,
   i64_sub: 0x7d,
   i64_mul: 0x7e,
   i64_and: 0x83,
@@ -76,50 +75,44 @@ const OP = {
   i64_shr_u: 0x88,
   i32_wrap_i64: 0xa7,
   i64_extend_i32_u: 0xad,
-  memory_copy_pre: 0xfc, // bulk memory: 0xfc 0x0a 0x00 0x00
-  memory_fill_pre: 0xfc, // bulk memory: 0xfc 0x0b 0x00
 };
 
-function pushUleb(out, v) {
+function writeUleb(buf, p, v) {
   v >>>= 0;
   while (v >= 0x80) {
-    out.push((v & 0x7f) | 0x80);
+    buf[p++] = (v & 0x7f) | 0x80;
     v >>>= 7;
   }
-  out.push(v);
+  buf[p++] = v;
+  return p;
 }
 
-function pushSleb32(out, v) {
+function writeSleb32(buf, p, v) {
   v |= 0;
   while (true) {
     const b = v & 0x7f;
     v >>= 7;
     if ((v === 0 && (b & 0x40) === 0) || (v === -1 && (b & 0x40) !== 0)) {
-      out.push(b);
-      break;
+      buf[p++] = b;
+      return p;
     }
-    out.push(b | 0x80);
+    buf[p++] = b | 0x80;
   }
 }
 
-function pushSleb64(out, v) {
-  let x = BigInt.asIntN(64, BigInt(v));
+function writeSleb64LH(buf, p, lo, hi) {
+  lo >>>= 0;
+  hi |= 0;
   while (true) {
-    const b = Number(x & 0x7fn);
-    x >>= 7n;
-    if ((x === 0n && (b & 0x40) === 0) || (x === -1n && (b & 0x40) !== 0)) {
-      out.push(b);
-      break;
+    const b = lo & 0x7f;
+    lo = ((lo >>> 7) | (hi << 25)) >>> 0;
+    hi >>= 7;
+    if ((hi === 0 && lo === 0 && (b & 0x40) === 0) || (hi === -1 && lo === 0xffffffff && (b & 0x40) !== 0)) {
+      buf[p++] = b;
+      return p;
     }
-    out.push(b | 0x80);
+    buf[p++] = b | 0x80;
   }
-}
-
-function encodeSection(id, payload) {
-  const sec = [id];
-  pushUleb(sec, payload.length);
-  for (let i = 0; i < payload.length; i++) sec.push(payload[i]);
-  return sec;
 }
 
 class FuncEmitter {
@@ -127,43 +120,66 @@ class FuncEmitter {
     this.params = params;
     this.results = results;
     this.locals = [];
-    this.code = [];
+    this.buf = new Uint8Array(8192);
+    this.pos = 0;
+  }
+  grow() {
+    const next = new Uint8Array(this.buf.length * 2);
+    next.set(this.buf);
+    this.buf = next;
   }
   loc(type = I32) {
     const idx = this.params.length + this.locals.length;
     this.locals.push(type);
     return idx;
   }
-  op(o) { this.code.push(o); return this; }
-  i32(v) { this.code.push(OP.i32_const); pushSleb32(this.code, v); return this; }
-  i64(v) { this.code.push(OP.i64_const); pushSleb64(this.code, v); return this; }
-  get(l) { this.code.push(OP.local_get); pushUleb(this.code, l); return this; }
-  set(l) { this.code.push(OP.local_set); pushUleb(this.code, l); return this; }
-  tee(l) { this.code.push(OP.local_tee); pushUleb(this.code, l); return this; }
-  gget(g) { this.code.push(OP.global_get); pushUleb(this.code, g); return this; }
-  gset(g) { this.code.push(OP.global_set); pushUleb(this.code, g); return this; }
-  call(f) { this.code.push(OP.call); pushUleb(this.code, f); return this; }
-  load32(off = 0) { this.code.push(OP.i32_load, 2); pushUleb(this.code, off); return this; }
-  load32u(off = 0) { this.code.push(OP.i32_load, 0); pushUleb(this.code, off); return this; }
-  load64(off = 0) { this.code.push(OP.i64_load, 0); pushUleb(this.code, off); return this; }
-  load8(off = 0) { this.code.push(OP.i32_load8_u, 0); pushUleb(this.code, off); return this; }
-  store32(off = 0) { this.code.push(OP.i32_store, 2); pushUleb(this.code, off); return this; }
-  store64(off = 0) { this.code.push(OP.i64_store, 0); pushUleb(this.code, off); return this; }
-  store8(off = 0) { this.code.push(OP.i32_store8, 0); pushUleb(this.code, off); return this; }
-  block(ty = VOID) { this.code.push(OP.block, ty); return this; }
-  loop(ty = VOID) { this.code.push(OP.loop, ty); return this; }
-  if_(ty = VOID) { this.code.push(OP.if, ty); return this; }
-  else_() { this.code.push(OP.else); return this; }
-  end() { this.code.push(OP.end); return this; }
-  br(d) { this.code.push(OP.br); pushUleb(this.code, d); return this; }
-  br_if(d) { this.code.push(OP.br_if); pushUleb(this.code, d); return this; }
-  ret() { this.code.push(OP.return); return this; }
-  memCopy() { this.code.push(0xfc, 0x0a, 0x00, 0x00); return this; }
-  memFill() { this.code.push(0xfc, 0x0b, 0x00); return this; }
-  memSize() { this.code.push(OP.memory_size, 0x00); return this; }
-  memGrow() { this.code.push(OP.memory_grow, 0x00); return this; }
+  op(o) { if (this.pos >= this.buf.length) this.grow(); this.buf[this.pos++] = o; return this; }
+  i32(v) {
+    if (this.pos + 6 > this.buf.length) this.grow();
+    this.buf[this.pos++] = OP.i32_const;
+    if (v >= -64 && v < 64) { this.buf[this.pos++] = v & 0x7f; return this; }
+    this.pos = writeSleb32(this.buf, this.pos, v);
+    return this;
+  }
+  i64(lo, hi = lo < 0 ? -1 : 0) {
+    if (this.pos + 11 > this.buf.length) this.grow();
+    this.buf[this.pos++] = OP.i64_const;
+    this.pos = writeSleb64LH(this.buf, this.pos, lo, hi);
+    return this;
+  }
+  get(l) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.local_get; if (l < 128) this.buf[this.pos++] = l; else this.pos = writeUleb(this.buf, this.pos, l); return this; }
+  set(l) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.local_set; if (l < 128) this.buf[this.pos++] = l; else this.pos = writeUleb(this.buf, this.pos, l); return this; }
+  tee(l) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.local_tee; if (l < 128) this.buf[this.pos++] = l; else this.pos = writeUleb(this.buf, this.pos, l); return this; }
+  gget(g) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.global_get; if (g < 128) this.buf[this.pos++] = g; else this.pos = writeUleb(this.buf, this.pos, g); return this; }
+  gset(g) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.global_set; if (g < 128) this.buf[this.pos++] = g; else this.pos = writeUleb(this.buf, this.pos, g); return this; }
+  call(f) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.call; if (f < 128) this.buf[this.pos++] = f; else this.pos = writeUleb(this.buf, this.pos, f); return this; }
+  load32(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i32_load; this.buf[this.pos++] = 2; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  load32u(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i32_load; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  load64(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i64_load; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  load8(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i32_load8_u; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  store32(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i32_store; this.buf[this.pos++] = 2; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  store64(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i64_store; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  store8(off = 0) { if (this.pos + 7 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.i32_store8; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  vload(off = 0) { if (this.pos + 8 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x00; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  vstore(off = 0) { if (this.pos + 8 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x0b; this.buf[this.pos++] = 0; if (off < 128) this.buf[this.pos++] = off; else this.pos = writeUleb(this.buf, this.pos, off); return this; }
+  vsplat8() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x0f; return this; }
+  veq8() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x23; return this; }
+  vlts8() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x25; return this; }
+  vbitmask8() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x64; return this; }
+  vor() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfd; this.buf[this.pos++] = 0x50; return this; }
+  block(ty = VOID) { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.block; this.buf[this.pos++] = ty; return this; }
+  loop(ty = VOID) { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.loop; this.buf[this.pos++] = ty; return this; }
+  if_(ty = VOID) { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.if; this.buf[this.pos++] = ty; return this; }
+  else_() { if (this.pos >= this.buf.length) this.grow(); this.buf[this.pos++] = OP.else; return this; }
+  end() { if (this.pos >= this.buf.length) this.grow(); this.buf[this.pos++] = OP.end; return this; }
+  br(d) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.br; if (d < 128) this.buf[this.pos++] = d; else this.pos = writeUleb(this.buf, this.pos, d); return this; }
+  br_if(d) { if (this.pos + 5 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.br_if; if (d < 128) this.buf[this.pos++] = d; else this.pos = writeUleb(this.buf, this.pos, d); return this; }
+  ret() { if (this.pos >= this.buf.length) this.grow(); this.buf[this.pos++] = OP.return; return this; }
+  memCopy() { if (this.pos + 4 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfc; this.buf[this.pos++] = 0x0a; this.buf[this.pos++] = 0; this.buf[this.pos++] = 0; return this; }
+  memFill() { if (this.pos + 3 > this.buf.length) this.grow(); this.buf[this.pos++] = 0xfc; this.buf[this.pos++] = 0x0b; this.buf[this.pos++] = 0; return this; }
+  memSize() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.memory_size; this.buf[this.pos++] = 0; return this; }
+  memGrow() { if (this.pos + 2 > this.buf.length) this.grow(); this.buf[this.pos++] = OP.memory_grow; this.buf[this.pos++] = 0; return this; }
 
-  // Compound helpers for clean readable expressions
   loadArr32(baseG, idxL) {
     return this.gget(baseG).get(idxL).i32(2).op(OP.i32_shl).op(OP.i32_add).load32();
   }
@@ -210,9 +226,8 @@ export function buildDiffWasm() {
   let globalCount = 0;
   const g = () => globalCount++;
 
-  // Globals (all mutable i32)
   const G = {
-    oBase: g(), oLen: g(), nBase: g(), nLen: g(),
+    oBase: g(), oLen: g(), nBase: g(), nLen: g(), arenaBase: g(),
     oStart: g(), nStart: g(), oEnd: g(), nEnd: g(),
     prefix: g(), suffix: g(), n: g(), m: g(),
     arenaPtr: g(),
@@ -220,7 +235,7 @@ export function buildDiffWasm() {
     nStarts: g(), nEnds: g(), nHash: g(),
     buckets: g(), hMask: g(),
     A: g(), B: g(), cntA: g(), cntB: g(), posB: g(), seen: g(),
-    remDel: g(), remIns: g(),
+    remDel: g(), remIns: g(), prefUniqA: g(), prefUniqB: g(),
     tailsVal: g(), tailsA: g(), prevIdx: g(), ancA: g(), ancB: g(),
     isUniq: g(), inLIS: g(), usedLIS: g(), grid64: g(),
     gVp: g(), gVc: g(),
@@ -233,13 +248,15 @@ export function buildDiffWasm() {
     hStart: g(), hEnd: g(), numHunks: g(),
     deleted: g(), inserted: g(),
     outBase: g(), outEnd: g(),
+    jsonLen: g(), jsonCur: g(), batchOutBase: g(),
   };
 
-  // Function indices
   let funcCount = 0;
   const fnId = () => funcCount++;
   const F = {
     ensureMem: fnId(),
+    prepareInput: fnId(),
+    prepareBatch: fnId(),
     countLines: fnId(),
     trimPrefixSuffix: fnId(),
     scanLines: fnId(),
@@ -249,12 +266,16 @@ export function buildDiffWasm() {
     replayPath: fnId(),
     buildChangesAndHunks: fnId(),
     writeDec: fnId(),
-    writeStrConst: fnId(),
     pushLineOut: fnId(),
     buildPatch: fnId(),
     solveAscii: fnId(),
     getOutBase: fnId(),
-    prepareInput: fnId(),
+    getBatchOutBase: fnId(),
+    skipWs: fnId(),
+    skipJsonStr: fnId(),
+    unescapeJsonStr: fnId(),
+    escapeJsonOut: fnId(),
+    solveBatchJson: fnId(),
   };
 
   const funcs = new Array(funcCount);
@@ -265,7 +286,7 @@ export function buildDiffWasm() {
     funcs[id] = { typeIdx: internType(params, results), emitter: f };
   };
 
-  // ------------------------------------------------------------------ 1. ensureMem(neededBytes)
+  // ------------------------------------------------------------------ ensureMem(neededBytes)
   addFunc(F.ensureMem, [I32], [], (f) => {
     const need = 0;
     const curBytes = f.loc();
@@ -278,48 +299,45 @@ export function buildDiffWasm() {
     f.end();
   });
 
-  // ------------------------------------------------------------------ 2. prepareInput(oLen, nLen) -> i32 (nBase)
+  // ------------------------------------------------------------------ prepareInput(oLen, nLen) -> nBase
   addFunc(F.prepareInput, [I32, I32], [I32], (f) => {
     const oLen = 0, nLen = 1;
-    const nBase = f.loc();
+    const nBase = f.loc(), ab = f.loc();
     f.i32(0).gset(G.oBase);
     f.get(oLen).gset(G.oLen);
-    f.get(oLen).i32(23).op(OP.i32_add).i32(-8).op(OP.i32_and).tee(nBase).gset(G.nBase);
+    f.get(oLen).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).tee(nBase).gset(G.nBase);
     f.get(nLen).gset(G.nLen);
-    f.get(nBase).get(nLen).op(OP.i32_add).i32(64).op(OP.i32_add).call(F.ensureMem);
+    f.get(nBase).get(nLen).op(OP.i32_add).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).tee(ab).gset(G.arenaBase);
+    f.get(ab).i32(64).op(OP.i32_add).call(F.ensureMem);
     f.get(nBase);
   });
 
-  // ------------------------------------------------------------------ 3. countLines(ptr, len) -> i32
-  // Exact 8-byte SWAR newline popcount without borrow propagation.
+  // ------------------------------------------------------------------ prepareBatch(jsonLen) -> jsonBase(0)
+  addFunc(F.prepareBatch, [I32], [I32], (f) => {
+    const jsonLen = 0;
+    f.get(jsonLen).gset(G.jsonLen);
+    f.get(jsonLen).i32(256).op(OP.i32_add).call(F.ensureMem);
+    f.i32(0);
+  });
+
+  // ------------------------------------------------------------------ countLines(ptr, len) -> i32 (SIMD128)
   addFunc(F.countLines, [I32, I32], [I32], (f) => {
     const ptr = 0, len = 1;
-    const cnt = f.loc(), end = f.loc(), end8 = f.loc(), p = f.loc();
-    const x = f.loc(I64), u = f.loc(I64);
+    const cnt = f.loc(), end = f.loc(), end16 = f.loc(), p = f.loc();
+    const nl16 = f.loc(V128);
     f.get(len).op(OP.i32_eqz).if_().i32(0).ret().end();
-    f.i32(0).set(cnt);
-    f.get(ptr).set(p);
-    f.get(ptr).get(len).op(OP.i32_add).set(end);
-    f.get(end).i32(8).op(OP.i32_sub).set(end8);
+    f.i32(0).set(cnt).get(ptr).set(p).get(ptr).get(len).op(OP.i32_add).tee(end).i32(16).op(OP.i32_sub).set(end16);
+    f.i32(10).vsplat8().set(nl16);
 
     f.block().loop();
-    f.get(p).get(end8).op(OP.i32_gt_s).br_if(1);
-    f.get(p).load64().i64(0x0a0a0a0a0a0a0a0an).op(OP.i64_xor).set(x);
-    f.get(x).i64(0x7f7f7f7f7f7f7f7fn).op(OP.i64_and).set(u);
-    f.get(u).i64(0x7f7f7f7f7f7f7f7fn).op(OP.i64_add)
-      .get(x).op(OP.i64_or)
-      .i64(0x7f7f7f7f7f7f7f7fn).op(OP.i64_or)
-      .i64(-1n).op(OP.i64_xor)
-      .op(OP.i64_popcnt).op(OP.i32_wrap_i64)
-      .get(cnt).op(OP.i32_add).set(cnt);
-    f.get(p).i32(8).op(OP.i32_add).set(p);
+    f.get(p).get(end16).op(OP.i32_gt_s).br_if(1);
+    f.get(cnt).get(p).vload().get(nl16).veq8().vbitmask8().op(OP.i32_popcnt).op(OP.i32_add).set(cnt);
+    f.get(p).i32(16).op(OP.i32_add).set(p);
     f.br(0).end().end();
 
     f.block().loop();
     f.get(p).get(end).op(OP.i32_ge_u).br_if(1);
-    f.get(p).load8().i32(10).op(OP.i32_eq).if_();
-    f.get(cnt).i32(1).op(OP.i32_add).set(cnt);
-    f.end();
+    f.get(p).load8().i32(10).op(OP.i32_eq).get(cnt).op(OP.i32_add).set(cnt);
     f.get(p).i32(1).op(OP.i32_add).set(p);
     f.br(0).end().end();
 
@@ -329,76 +347,68 @@ export function buildDiffWasm() {
     f.get(cnt);
   });
 
-  // ------------------------------------------------------------------ 4. trimPrefixSuffix()
+  // ------------------------------------------------------------------ trimPrefixSuffix() (SIMD128)
   addFunc(F.trimPrefixSuffix, [], [], (f) => {
     const oBase = f.loc(), nBase = f.loc(), oLen = f.loc(), nLen = f.loc();
-    const minL = f.loc(), p = f.loc(), min8 = f.loc();
-    const oPtr = f.loc(), nPtr = f.loc(), s = f.loc(), maxS = f.loc(), maxS8 = f.loc();
-    const b1 = f.loc(), b2 = f.loc(), diff = f.loc(I64);
+    const minL = f.loc(), p = f.loc(), min16 = f.loc();
+    const oPtr = f.loc(), nPtr = f.loc(), s = f.loc(), maxS = f.loc(), maxS16 = f.loc();
+    const b1 = f.loc(), b2 = f.loc(), mask = f.loc();
 
-    f.gget(G.oBase).set(oBase);
-    f.gget(G.nBase).set(nBase);
-    f.gget(G.oLen).set(oLen);
-    f.gget(G.nLen).set(nLen);
+    f.gget(G.oBase).set(oBase).gget(G.nBase).set(nBase).gget(G.oLen).set(oLen).gget(G.nLen).set(nLen);
     f.get(oLen).get(nLen).get(oLen).get(nLen).op(OP.i32_lt_u).op(OP.select).set(minL);
 
-    // Common byte prefix via i64.load
-    f.i32(0).set(p);
-    f.get(minL).i32(8).op(OP.i32_sub).set(min8);
+    // Common prefix 16 bytes/iter
+    f.i32(0).set(p).get(minL).i32(16).op(OP.i32_sub).set(min16);
     f.block().loop();
-    f.get(p).get(min8).op(OP.i32_gt_s).br_if(1);
-    f.get(oBase).get(p).op(OP.i32_add).load64()
-      .get(nBase).get(p).op(OP.i32_add).load64()
-      .op(OP.i64_xor).tee(diff).op(OP.i64_eqz).op(OP.i32_eqz).if_();
-    f.get(p).get(diff).op(OP.i64_ctz).op(OP.i32_wrap_i64).i32(3).op(OP.i32_shr_u).op(OP.i32_add).set(p);
+    f.get(p).get(min16).op(OP.i32_gt_s).br_if(1);
+    f.get(oBase).get(p).op(OP.i32_add).vload()
+      .get(nBase).get(p).op(OP.i32_add).vload()
+      .veq8().vbitmask8().i32(0xffff).op(OP.i32_xor).tee(mask).if_();
+    f.get(p).get(mask).op(OP.i32_ctz).op(OP.i32_add).set(p);
     f.br(2);
     f.end();
-    f.get(p).i32(8).op(OP.i32_add).set(p);
+    f.get(p).i32(16).op(OP.i32_add).set(p);
     f.br(0).end().end();
 
     f.block().loop();
     f.get(p).get(minL).op(OP.i32_ge_u).br_if(1);
-    f.get(oBase).get(p).op(OP.i32_add).load8()
-      .get(nBase).get(p).op(OP.i32_add).load8()
-      .op(OP.i32_ne).br_if(1);
+    f.get(oBase).get(p).op(OP.i32_add).load8().get(nBase).get(p).op(OP.i32_add).load8().op(OP.i32_ne).br_if(1);
     f.get(p).i32(1).op(OP.i32_add).set(p);
     f.br(0).end().end();
 
-    // If identical:
+    // Identical fast exit
     f.get(p).get(oLen).op(OP.i32_eq).get(p).get(nLen).op(OP.i32_eq).op(OP.i32_and).if_();
     f.get(oBase).get(oLen).call(F.countLines).gset(G.prefix);
     f.i32(0).gset(G.suffix);
-    f.get(oLen).gset(G.oStart);
-    f.get(nLen).gset(G.nStart);
-    f.get(oLen).gset(G.oEnd);
-    f.get(nLen).gset(G.nEnd);
+    f.get(oLen).gset(G.oStart).get(nLen).gset(G.nStart).get(oLen).gset(G.oEnd).get(nLen).gset(G.nEnd);
     f.ret();
     f.end();
 
-    // Roll back p to line boundary (after previous 0x0a or 0)
+    // Roll back p to line boundary
     f.block().loop();
     f.get(p).op(OP.i32_eqz).br_if(1);
     f.get(oBase).get(p).op(OP.i32_add).i32(1).op(OP.i32_sub).load8().i32(10).op(OP.i32_eq).br_if(1);
     f.get(p).i32(1).op(OP.i32_sub).set(p);
     f.br(0).end().end();
 
-    f.get(p).gset(G.oStart);
-    f.get(p).gset(G.nStart);
+    f.get(p).gset(G.oStart).get(p).gset(G.nStart);
     f.get(oBase).get(p).call(F.countLines).gset(G.prefix);
 
-    // Common byte suffix from oLen, nLen back to p
+    // Common suffix 16 bytes/iter
     f.get(oLen).get(p).op(OP.i32_sub).set(b1);
     f.get(nLen).get(p).op(OP.i32_sub).set(b2);
     f.get(b1).get(b2).get(b1).get(b2).op(OP.i32_lt_u).op(OP.select).set(maxS);
-    f.i32(0).set(s);
-    f.get(maxS).i32(8).op(OP.i32_sub).set(maxS8);
+    f.i32(0).set(s).get(maxS).i32(16).op(OP.i32_sub).set(maxS16);
 
     f.block().loop();
-    f.get(s).get(maxS8).op(OP.i32_gt_s).br_if(1);
-    f.get(oBase).get(oLen).op(OP.i32_add).get(s).op(OP.i32_sub).i32(8).op(OP.i32_sub).load64()
-      .get(nBase).get(nLen).op(OP.i32_add).get(s).op(OP.i32_sub).i32(8).op(OP.i32_sub).load64()
-      .op(OP.i64_ne).br_if(1);
-    f.get(s).i32(8).op(OP.i32_add).set(s);
+    f.get(s).get(maxS16).op(OP.i32_gt_s).br_if(1);
+    f.get(oBase).get(oLen).op(OP.i32_add).get(s).op(OP.i32_sub).i32(16).op(OP.i32_sub).vload()
+      .get(nBase).get(nLen).op(OP.i32_add).get(s).op(OP.i32_sub).i32(16).op(OP.i32_sub).vload()
+      .veq8().vbitmask8().i32(0xffff).op(OP.i32_xor).tee(mask).if_();
+    f.get(s).get(mask).i32(16).op(OP.i32_shl).op(OP.i32_clz).op(OP.i32_add).set(s);
+    f.br(2);
+    f.end();
+    f.get(s).i32(16).op(OP.i32_add).set(s);
     f.br(0).end().end();
 
     f.block().loop();
@@ -413,13 +423,11 @@ export function buildDiffWasm() {
     f.get(nLen).get(s).op(OP.i32_sub).set(nPtr);
 
     f.get(s).i32(0).op(OP.i32_gt_s).if_();
-    // Check if already at line boundary in both
     f.get(oPtr).get(p).op(OP.i32_eq)
       .if_(I32).i32(1).else_().get(oBase).get(oPtr).op(OP.i32_add).i32(1).op(OP.i32_sub).load8().i32(10).op(OP.i32_eq).end()
       .get(nPtr).get(p).op(OP.i32_eq)
       .if_(I32).i32(1).else_().get(nBase).get(nPtr).op(OP.i32_add).i32(1).op(OP.i32_sub).load8().i32(10).op(OP.i32_eq).end()
       .op(OP.i32_and).op(OP.i32_eqz).if_();
-    // Advance oPtr & nPtr together to just after next 0x0a in [oPtr..oLen)
     f.block().loop();
     f.get(oPtr).get(oLen).op(OP.i32_ge_u).br_if(1);
     f.get(oBase).get(oPtr).op(OP.i32_add).load8().i32(10).op(OP.i32_eq).if_();
@@ -433,13 +441,11 @@ export function buildDiffWasm() {
     f.end();
     f.end();
 
-    f.get(oPtr).gset(G.oEnd);
-    f.get(nPtr).gset(G.nEnd);
+    f.get(oPtr).gset(G.oEnd).get(nPtr).gset(G.nEnd);
     f.get(oBase).get(oPtr).op(OP.i32_add).get(oLen).get(oPtr).op(OP.i32_sub).call(F.countLines).gset(G.suffix);
   });
 
-  // ------------------------------------------------------------------ 5. scanLines()
-  // Allocates arena arrays for exact (n, m) and scans + hashes lines using 64-bit i64 hash.
+  // ------------------------------------------------------------------ scanLines() (SIMD128 + 64-bit FNV-1a)
   addFunc(F.scanLines, [], [], (f) => {
     const n = f.loc(), m = f.loc(), minNM = f.loc(), hCap = f.loc(), ptr = f.loc();
     const allocArr = (gVar, bytesExpr) => {
@@ -453,7 +459,7 @@ export function buildDiffWasm() {
     f.gget(G.nBase).gget(G.nStart).op(OP.i32_add).gget(G.nEnd).gget(G.nStart).op(OP.i32_sub).call(F.countLines).tee(m).gset(G.m);
     f.get(n).get(m).get(n).get(m).op(OP.i32_lt_u).op(OP.select).set(minNM);
 
-    f.gget(G.nBase).gget(G.nLen).op(OP.i32_add).i32(31).op(OP.i32_add).i32(-8).op(OP.i32_and).set(ptr);
+    f.gget(G.arenaBase).set(ptr);
     allocArr(G.oStarts, () => f.get(n).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.oEnds, () => f.get(n).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.oHash, () => f.get(n).i32(4).op(OP.i32_add).i32(3).op(OP.i32_shl));
@@ -461,9 +467,7 @@ export function buildDiffWasm() {
     allocArr(G.nEnds, () => f.get(m).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.nHash, () => f.get(m).i32(4).op(OP.i32_add).i32(3).op(OP.i32_shl));
 
-    // If n===0 || m===0, stop early — no intern/myers needed!
     f.get(n).op(OP.i32_eqz).get(m).op(OP.i32_eqz).op(OP.i32_or).if_();
-    // Still need oStarts/oEnds or nStarts/nEnds for the single non-empty side!
     allocArr(G.changesO, () => f.i32(16));
     allocArr(G.changesP, () => f.i32(16));
     allocArr(G.changesD, () => f.i32(16));
@@ -472,9 +476,8 @@ export function buildDiffWasm() {
     allocArr(G.hEnd, () => f.i32(16));
     f.get(ptr).gset(G.arenaPtr);
     f.get(ptr).i32(64).op(OP.i32_add).call(F.ensureMem);
-    // Scan whichever of n, m > 0
-    const scanSide = (baseG, stG, enG, startsG, endsG, hashG) => {
-      const idx = f.loc(), pos = f.loc(), end = f.loc(), base = f.loc(), ls = f.loc(), e = f.loc();
+    const scanSide = (baseG, stG, enG, startsG, endsG) => {
+      const idx = f.loc(), pos = f.loc(), end = f.loc(), base = f.loc(), ls = f.loc();
       f.gget(baseG).set(base).gget(stG).set(pos).gget(enG).set(end).i32(0).set(idx);
       f.block().loop();
       f.get(pos).get(end).op(OP.i32_ge_u).br_if(1);
@@ -491,12 +494,11 @@ export function buildDiffWasm() {
       f.get(idx).i32(1).op(OP.i32_add).set(idx);
       f.br(0).end().end();
     };
-    f.get(n).if_(); scanSide(G.oBase, G.oStart, G.oEnd, G.oStarts, G.oEnds, G.oHash); f.end();
-    f.get(m).if_(); scanSide(G.nBase, G.nStart, G.nEnd, G.nStarts, G.nEnds, G.nHash); f.end();
+    f.get(n).if_(); scanSide(G.oBase, G.oStart, G.oEnd, G.oStarts, G.oEnds); f.end();
+    f.get(m).if_(); scanSide(G.nBase, G.nStart, G.nEnd, G.nStarts, G.nEnds); f.end();
     f.ret();
     f.end();
 
-    // Full arena allocation
     f.i32(16).set(hCap);
     f.block().loop();
     f.get(hCap).get(n).i32(1).op(OP.i32_shl).op(OP.i32_ge_u).br_if(1);
@@ -513,6 +515,8 @@ export function buildDiffWasm() {
     allocArr(G.seen, () => f.get(n).i32(2).op(OP.i32_shl));
     allocArr(G.remDel, () => f.get(n).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.remIns, () => f.get(m).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
+    allocArr(G.prefUniqA, () => f.get(n).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
+    allocArr(G.prefUniqB, () => f.get(m).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.tailsVal, () => f.get(minNM).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.tailsA, () => f.get(minNM).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
     allocArr(G.prevIdx, () => f.get(n).i32(4).op(OP.i32_add).i32(2).op(OP.i32_shl));
@@ -527,43 +531,67 @@ export function buildDiffWasm() {
     f.get(ptr).gset(G.arenaPtr);
     f.get(ptr).i32(64).op(OP.i32_add).call(F.ensureMem);
 
-    // Zero buckets, cntA, cntB
     f.gget(G.buckets).i32(0).get(hCap).i32(2).op(OP.i32_shl).memFill();
     f.gget(G.cntA).i32(0).get(n).i32(2).op(OP.i32_shl).memFill();
     f.gget(G.cntB).i32(0).get(n).i32(2).op(OP.i32_shl).memFill();
 
-    // Scan & 64-bit SWAR hash lines for A and B
     const scanHashSide = (baseG, stG, enG, startsG, endsG, hashG) => {
       const idx = f.loc(), pos = f.loc(), end = f.loc(), base = f.loc(), ls = f.loc();
-      const end8 = f.loc(), w = f.loc(I64), x = f.loc(I64), z = f.loc(I64), h = f.loc(I64), b = f.loc(), tailMask = f.loc(I64), tailW = f.loc(I64), sh = f.loc();
+      const end16 = f.loc(), end8 = f.loc(), b = f.loc(), sh = f.loc(), mask = f.loc();
+      const w = f.loc(I64), x = f.loc(I64), z = f.loc(I64), h = f.loc(I64), tailMask = f.loc(I64), tailW = f.loc(I64);
+      const nl16 = f.loc(V128);
       f.gget(baseG).set(base).gget(stG).set(pos).gget(enG).set(end).i32(0).set(idx);
+      f.get(end).i32(16).op(OP.i32_sub).set(end16);
       f.get(end).i32(8).op(OP.i32_sub).set(end8);
+      f.i32(10).vsplat8().set(nl16);
+
       f.block().loop();
       f.get(pos).get(end).op(OP.i32_ge_u).br_if(1);
       f.get(pos).set(ls);
-      f.i64(0xcbf29ce484222325n).set(h);
-      f.block(); // foundLine block (skips byte tail if SWAR already found \n)
-      // 8-byte SWAR newline scan + 64-bit FNV-1a mix
+      f.i64(0x84222325, 0xcbf29ce4).set(h);
+
+      f.block(); // foundLine
+      // 16-byte SIMD128 newline scan + dual i64 FNV-1a mix
       f.block().loop();
-      f.get(pos).get(end8).op(OP.i32_gt_s).br_if(1);
-      f.get(base).get(pos).op(OP.i32_add).load64().tee(w).i64(0x0a0a0a0a0a0a0a0an).op(OP.i64_xor).set(x);
-      f.get(x).i64(0x0101010101010101n).op(OP.i64_sub)
-        .get(x).i64(-1n).op(OP.i64_xor).op(OP.i64_and)
-        .i64(0x8080808080808080n).op(OP.i64_and).tee(z).op(OP.i64_eqz).op(OP.i32_eqz).if_();
-      // Found 0x0a at byte b = ctz(z) >> 3
-      f.get(z).op(OP.i64_ctz).op(OP.i32_wrap_i64).i32(3).op(OP.i32_shr_u).set(b);
-      // Mask bytes 0..b (b+1 bytes) of w: (-1 >>> ((7 - b) * 8))
-      f.i64(-1n).i32(7).get(b).op(OP.i32_sub).i32(3).op(OP.i32_shl).op(OP.i64_extend_i32_u).op(OP.i64_shr_u).set(tailMask);
-      f.get(h).get(w).get(tailMask).op(OP.i64_and).op(OP.i64_xor).i64(0x100000001b3n).op(OP.i64_mul).set(h);
+      f.get(pos).get(end16).op(OP.i32_gt_s).br_if(1);
+      f.get(base).get(pos).op(OP.i32_add).vload().get(nl16).veq8().vbitmask8().tee(mask).if_();
+      f.get(mask).op(OP.i32_ctz).set(b);
+      f.get(b).i32(8).op(OP.i32_ge_s).if_();
+      f.get(h).get(base).get(pos).op(OP.i32_add).load64().op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
+      f.i64(-1).i32(15).get(b).op(OP.i32_sub).i32(3).op(OP.i32_shl).op(OP.i64_extend_i32_u).op(OP.i64_shr_u).set(tailMask);
+      f.get(h).get(base).get(pos).op(OP.i32_add).i32(8).op(OP.i32_add).load64().get(tailMask).op(OP.i64_and).op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
+      f.else_();
+      f.i64(-1).i32(7).get(b).op(OP.i32_sub).i32(3).op(OP.i32_shl).op(OP.i64_extend_i32_u).op(OP.i64_shr_u).set(tailMask);
+      f.get(h).get(base).get(pos).op(OP.i32_add).load64().get(tailMask).op(OP.i64_and).op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
+      f.end();
       f.get(pos).get(b).op(OP.i32_add).i32(1).op(OP.i32_add).set(pos);
       f.br(3);
       f.end();
-      f.get(h).get(w).op(OP.i64_xor).i64(0x100000001b3n).op(OP.i64_mul).set(h);
+      // No newline in 16 bytes -> hash two i64 words
+      f.get(h).get(base).get(pos).op(OP.i32_add).load64().op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul)
+        .get(base).get(pos).op(OP.i32_add).i32(8).op(OP.i32_add).load64().op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
+      f.get(pos).i32(16).op(OP.i32_add).set(pos);
+      f.br(0).end().end();
+
+      // 8-byte SWAR tail (< 16 bytes remaining)
+      f.block().loop();
+      f.get(pos).get(end8).op(OP.i32_gt_s).br_if(1);
+      f.get(base).get(pos).op(OP.i32_add).load64().tee(w).i64(0x0a0a0a0a, 0x0a0a0a0a).op(OP.i64_xor).set(x);
+      f.get(x).i64(0x01010101, 0x01010101).op(OP.i64_sub)
+        .get(x).i64(-1).op(OP.i64_xor).op(OP.i64_and)
+        .i64(0x80808080, 0x80808080).op(OP.i64_and).tee(z).op(OP.i64_eqz).op(OP.i32_eqz).if_();
+      f.get(z).op(OP.i64_ctz).op(OP.i32_wrap_i64).i32(3).op(OP.i32_shr_u).set(b);
+      f.i64(-1).i32(7).get(b).op(OP.i32_sub).i32(3).op(OP.i32_shl).op(OP.i64_extend_i32_u).op(OP.i64_shr_u).set(tailMask);
+      f.get(h).get(w).get(tailMask).op(OP.i64_and).op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
+      f.get(pos).get(b).op(OP.i32_add).i32(1).op(OP.i32_add).set(pos);
+      f.br(3);
+      f.end();
+      f.get(h).get(w).op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
       f.get(pos).i32(8).op(OP.i32_add).set(pos);
       f.br(0).end().end();
 
-      // Byte tail for < 8 bytes: pack into little-endian tailW so hash matches SWAR tailMask!
-      f.i64(0n).set(tailW).i32(0).set(sh);
+      // Byte tail (< 8 bytes remaining)
+      f.i64(0).set(tailW).i32(0).set(sh);
       f.block().loop();
       f.get(pos).get(end).op(OP.i32_ge_u).br_if(1);
       f.get(base).get(pos).op(OP.i32_add).load8().set(b);
@@ -573,9 +601,9 @@ export function buildDiffWasm() {
       f.get(b).i32(10).op(OP.i32_eq).br_if(1);
       f.br(0).end().end();
       f.get(sh).if_();
-      f.get(h).get(tailW).op(OP.i64_xor).i64(0x100000001b3n).op(OP.i64_mul).set(h);
+      f.get(h).get(tailW).op(OP.i64_xor).i64(0x1b3, 0x100).op(OP.i64_mul).set(h);
       f.end();
-      f.end(); // end foundLine block
+      f.end(); // end foundLine
 
       f.storeArr32(startsG, idx, () => f.get(ls));
       f.storeArr32(endsG, idx, () => f.get(pos));
@@ -587,7 +615,7 @@ export function buildDiffWasm() {
     scanHashSide(G.nBase, G.nStart, G.nEnd, G.nStarts, G.nEnds, G.nHash);
   });
 
-  // ------------------------------------------------------------------ 6. internLines()
+  // ------------------------------------------------------------------ internLines()
   addFunc(F.internLines, [], [], (f) => {
     const n = f.loc(), m = f.loc(), hMask = f.loc(), oBase = f.loc(), nBase = f.loc();
     const i = f.loc(), st = f.loc(), len = f.loc(), hi = f.loc(I64), slot = f.loc(), bk = f.loc(), rep = f.loc();
@@ -595,12 +623,11 @@ export function buildDiffWasm() {
 
     f.gget(G.n).set(n).gget(G.m).set(m).gget(G.hMask).set(hMask).gget(G.oBase).set(oBase).gget(G.nBase).set(nBase);
 
-    // Emit equality helper macro for two byte slices (base1+rs, base2+st, len) -> br_if match
     const checkEq = (base2L, onMatch) => {
       f.get(oBase).get(rs).op(OP.i32_add).set(p1);
       f.get(base2L).get(st).op(OP.i32_add).set(p2);
       f.i32(0).set(k);
-      f.block(); // mismatch block
+      f.block();
       f.block().loop();
       f.get(k).i32(8).op(OP.i32_add).get(len).op(OP.i32_gt_u).br_if(1);
       f.get(p1).get(k).op(OP.i32_add).load64().get(p2).get(k).op(OP.i32_add).load64().op(OP.i64_ne).br_if(2);
@@ -615,15 +642,13 @@ export function buildDiffWasm() {
       f.end();
     };
 
-    // Intern old lines
     f.i32(0).set(i);
     f.block().loop();
     f.get(i).get(n).op(OP.i32_ge_u).br_if(1);
     f.loadArr32(G.oStarts, i).set(st);
     f.loadArr32(G.oEnds, i).get(st).op(OP.i32_sub).set(len);
     f.loadArr64(G.oHash, i).set(hi);
-    // Mix upper and lower 32 bits for slot
-    f.get(hi).get(hi).i64(32n).op(OP.i64_shr_u).op(OP.i64_xor).op(OP.i32_wrap_i64).get(hMask).op(OP.i32_and).set(slot);
+    f.get(hi).get(hi).i64(32).op(OP.i64_shr_u).op(OP.i64_xor).op(OP.i32_wrap_i64).get(hMask).op(OP.i32_and).set(slot);
     f.block().loop();
     f.loadArr32(G.buckets, slot).tee(bk).op(OP.i32_eqz).if_();
     f.storeArr32(G.buckets, slot, () => f.get(i).i32(1).op(OP.i32_add));
@@ -646,14 +671,13 @@ export function buildDiffWasm() {
     f.get(i).i32(1).op(OP.i32_add).set(i);
     f.br(0).end().end();
 
-    // Lookup new lines
     f.i32(0).set(i);
     f.block().loop();
     f.get(i).get(m).op(OP.i32_ge_u).br_if(1);
     f.loadArr32(G.nStarts, i).set(st);
     f.loadArr32(G.nEnds, i).get(st).op(OP.i32_sub).set(len);
     f.loadArr64(G.nHash, i).set(hi);
-    f.get(hi).get(hi).i64(32n).op(OP.i64_shr_u).op(OP.i64_xor).op(OP.i32_wrap_i64).get(hMask).op(OP.i32_and).set(slot);
+    f.get(hi).get(hi).i64(32).op(OP.i64_shr_u).op(OP.i64_xor).op(OP.i32_wrap_i64).get(hMask).op(OP.i32_and).set(slot);
     f.i32(-3).set(found);
     f.block().loop();
     f.loadArr32(G.buckets, slot).tee(bk).op(OP.i32_eqz).br_if(1);
@@ -675,7 +699,7 @@ export function buildDiffWasm() {
     f.br(0).end().end();
   });
 
-  // ------------------------------------------------------------------ 7. buildBoundsAndUB() -> i32 U
+  // ------------------------------------------------------------------ buildBoundsAndUB() -> U
   addFunc(F.buildBoundsAndUB, [], [I32], (f) => {
     const n = f.loc(), m = f.loc(), i = f.loc(), acc = f.loc(), id = f.loc(), sc = f.loc();
     const tLen = f.loc(), j = f.loc(), lo = f.loc(), hi = f.loc(), mid = f.loc(), cur = f.loc(), k = f.loc();
@@ -687,7 +711,7 @@ export function buildDiffWasm() {
 
     f.gget(G.n).set(n).gget(G.m).set(m);
 
-    // 1. remDel[0..n]
+    // 1. remDel[0..n] and remIns[0..m]
     f.gget(G.seen).i32(0).get(n).i32(2).op(OP.i32_shl).memFill();
     f.i32(0).set(acc).get(n).i32(1).op(OP.i32_sub).set(i);
     f.block().loop();
@@ -701,7 +725,6 @@ export function buildDiffWasm() {
     f.br(0).end().end();
     f.storeArr32(G.remDel, n, () => f.i32(0));
 
-    // remIns[0..m]
     f.gget(G.seen).i32(0).get(n).i32(2).op(OP.i32_shl).memFill();
     f.i32(0).set(acc).get(m).i32(1).op(OP.i32_sub).set(i);
     f.block().loop();
@@ -718,7 +741,7 @@ export function buildDiffWasm() {
     f.br(0).end().end();
     f.storeArr32(G.remIns, m, () => f.i32(0));
 
-    // 2. isUniq & Patience LIS
+    // 2. isUniq + prefUniqA + prefUniqB + Patience LIS
     f.i32(0).set(i);
     f.block().loop();
     f.get(i).get(n).op(OP.i32_ge_u).br_if(1);
@@ -726,6 +749,27 @@ export function buildDiffWasm() {
       f.loadArr32(G.cntA, i).i32(1).op(OP.i32_eq).loadArr32(G.cntB, i).i32(1).op(OP.i32_eq).op(OP.i32_and)
     );
     f.get(i).i32(1).op(OP.i32_add).set(i);
+    f.br(0).end().end();
+
+    f.gget(G.prefUniqA).i32(0).store32(0);
+    f.i32(0).set(acc).i32(0).set(i);
+    f.block().loop();
+    f.get(i).get(n).op(OP.i32_ge_u).br_if(1);
+    f.loadArr32(G.A, i).set(id);
+    f.get(acc).loadArr8(G.isUniq, id).op(OP.i32_add).set(acc);
+    f.get(i).i32(1).op(OP.i32_add).tee(i);
+    f.storeArr32(G.prefUniqA, i, () => f.get(acc));
+    f.br(0).end().end();
+
+    f.gget(G.prefUniqB).i32(0).store32(0);
+    f.i32(0).set(acc).i32(0).set(i);
+    f.block().loop();
+    f.get(i).get(m).op(OP.i32_ge_u).br_if(1);
+    f.loadArr32(G.B, i).tee(id).i32(0).op(OP.i32_ge_s).if_();
+    f.get(acc).loadArr8(G.isUniq, id).op(OP.i32_add).set(acc);
+    f.end();
+    f.get(i).i32(1).op(OP.i32_add).tee(i);
+    f.storeArr32(G.prefUniqB, i, () => f.get(acc));
     f.br(0).end().end();
 
     f.i32(0).set(tLen).i32(0).set(i);
@@ -818,7 +862,6 @@ export function buildDiffWasm() {
     f.get(i).i32(1).op(OP.i32_add).set(i);
     f.br(0).end().end();
 
-    // 2D suffix sums on grid64
     f.i32(63).set(gx);
     f.block().loop();
     f.get(gx).i32(0).op(OP.i32_lt_s).br_if(1);
@@ -867,7 +910,7 @@ export function buildDiffWasm() {
     f.get(gm).i32(1).op(OP.i32_sub).set(gm);
     f.br(0).end().end();
 
-    f.block(); // continue block for g
+    f.block();
     f.get(gn).op(OP.i32_eqz).if_().get(U).get(gm).op(OP.i32_add).set(U).br(1).end();
     f.get(gm).op(OP.i32_eqz).if_().get(U).get(gn).op(OP.i32_add).set(U).br(1).end();
 
@@ -928,7 +971,7 @@ export function buildDiffWasm() {
     f.storeArr32(G.A, cur, () => f.get(sA));
     f.storeArr32(G.B, mid, () => f.get(sB));
     f.get(solved).op(OP.i32_eqz).if_().get(U).get(gn).op(OP.i32_add).get(gm).op(OP.i32_add).set(U).end();
-    f.end(); // continue block
+    f.end();
 
     f.get(g).i32(1).op(OP.i32_add).set(g);
     f.br(0).end().end();
@@ -936,7 +979,7 @@ export function buildDiffWasm() {
     f.get(lo);
   });
 
-  // ------------------------------------------------------------------ 8. myersForward()
+  // ------------------------------------------------------------------ myersForward() with dominance pruning
   addFunc(F.myersForward, [], [], (f) => {
     const n = f.loc(), m = f.loc(), U = f.loc(), delta = f.loc(), ptr = f.loc();
     const bShift = f.loc(), bStep = f.loc(), bMask = f.loc(), nCkpts = f.loc();
@@ -944,34 +987,31 @@ export function buildDiffWasm() {
     const remD = f.loc(), lim1 = f.loc(), lim2 = f.loc(), loK = f.loc(), hiK = f.loc(), iLo = f.loc(), iHi = f.loc();
     const idx = f.loc(), k = f.loc(), endIdx = f.loc(), xRem = f.loc(), xAdd = f.loc(), nx = f.loc(), ny = f.loc();
     const canRem = f.loc(), canAdd = f.loc(), qx = f.loc(), qy = f.loc(), cc = f.loc(), tmp = f.loc();
+    const pa = f.loc(), pb = f.loc(), exIns = f.loc(), exDel = f.loc();
     const cCount = f.loc(), metaPtr = f.loc(), bytesNeed = f.loc();
+    const aBase = f.loc(), bBase = f.loc(), vpBase = f.loc(), vcBase = f.loc();
 
+    f.gget(G.A).set(aBase).gget(G.B).set(bBase);
     f.gget(G.n).set(n).gget(G.m).set(m).gget(G.U).set(U);
     f.get(n).get(m).op(OP.i32_sub).set(delta);
     f.get(U).i32(8192).op(OP.i32_le_s).if_();
-    f.i32(5).set(bShift).i32(32).set(bStep).i32(31).set(bMask);
+    f.i32(6).set(bShift).i32(64).set(bStep).i32(63).set(bMask);
     f.else_();
     f.i32(7).set(bShift).i32(128).set(bStep).i32(127).set(bMask);
     f.end();
     f.get(bShift).gset(G.bShift).get(bStep).gset(G.bStep).get(bMask).gset(G.bMask);
 
-    // Arena for Vp, Vc, repBuf, ckptMeta, ckptData
     f.gget(G.arenaPtr).set(ptr);
-    f.get(ptr).gset(G.Vp);
-    f.get(ptr).get(U).i32(8).op(OP.i32_add).i32(2).op(OP.i32_shl).op(OP.i32_add).set(ptr);
-    f.get(ptr).gset(G.Vc);
-    f.get(ptr).get(U).i32(8).op(OP.i32_add).i32(2).op(OP.i32_shl).op(OP.i32_add).set(ptr);
+    f.get(ptr).tee(vpBase).gset(G.Vp).get(ptr).get(U).i32(8).op(OP.i32_add).i32(2).op(OP.i32_shl).op(OP.i32_add).set(ptr);
+    f.get(ptr).tee(vcBase).gset(G.Vc).get(ptr).get(U).i32(8).op(OP.i32_add).i32(2).op(OP.i32_shl).op(OP.i32_add).set(ptr);
     f.get(ptr).gset(G.repBuf);
     f.get(ptr).get(bStep).i32(1).op(OP.i32_add).get(bStep).i32(4).op(OP.i32_add).op(OP.i32_mul).i32(2).op(OP.i32_shl).op(OP.i32_add).set(ptr);
     f.get(U).get(bShift).op(OP.i32_shr_u).i32(2).op(OP.i32_add).set(nCkpts);
-    f.get(ptr).gset(G.ckptMeta);
-    f.get(ptr).get(nCkpts).i32(4).op(OP.i32_shl).op(OP.i32_add).set(ptr);
-    f.get(ptr).gset(G.ckptData);
-    f.get(ptr).gset(G.ckptDataPtr);
+    f.get(ptr).gset(G.ckptMeta).get(ptr).get(nCkpts).i32(4).op(OP.i32_shl).op(OP.i32_add).set(ptr);
+    f.get(ptr).gset(G.ckptData).get(ptr).gset(G.ckptDataPtr);
     f.get(ptr).i32(1048576).op(OP.i32_add).tee(tmp).gset(G.ckptCap);
     f.get(tmp).call(F.ensureMem);
 
-    // Sentinels A[n]=-1, B[m]=-2
     f.storeArr32(G.A, n, () => f.i32(-1));
     f.storeArr32(G.B, m, () => f.i32(-2));
     f.gget(G.Vp).i32(-2).get(U).i32(8).op(OP.i32_add).i32(2).op(OP.i32_shl).memFill();
@@ -984,7 +1024,6 @@ export function buildDiffWasm() {
     f.br(0).end().end();
     f.gget(G.Vp).get(x0).store32(0);
 
-    // Save checkpoint 0: meta = (iLo=0, loK=0, hiK=0, dataPtr)
     f.gget(G.ckptMeta).set(metaPtr);
     f.get(metaPtr).i32(0).store32(0);
     f.get(metaPtr).i32(0).store32(4);
@@ -998,10 +1037,26 @@ export function buildDiffWasm() {
     f.i32(0).set(kLo).i32(0).set(kHi);
     f.get(x0).get(n).op(OP.i32_ge_s).get(x0).get(m).op(OP.i32_ge_s).op(OP.i32_or).set(hitBound);
 
+    // Pushes 1 (valid) or 0 (pruned) for (nx, ny) on diagonal kL
+    const emitIsValid = (kL) => {
+      f.get(nx).i32(6).op(OP.i32_shl).get(n).op(OP.i32_add).i32(1).op(OP.i32_sub).get(n).op(OP.i32_div_u).set(qx);
+      f.get(ny).i32(6).op(OP.i32_shl).get(m).op(OP.i32_add).i32(1).op(OP.i32_sub).get(m).op(OP.i32_div_u).set(qy);
+      f.get(qx).i32(65).op(OP.i32_mul).get(qy).op(OP.i32_add).set(tmp);
+      f.loadArr32(G.grid64, tmp).set(cc);
+      f.loadArr32(G.prefUniqA, nx).set(pa);
+      f.loadArr32(G.prefUniqB, ny).set(pb);
+      f.get(pa).get(pb).op(OP.i32_gt_s).if_(I32).get(pa).get(pb).op(OP.i32_sub).else_().i32(0).end().set(exIns);
+      f.get(pb).get(pa).op(OP.i32_gt_s).if_(I32).get(pb).get(pa).op(OP.i32_sub).else_().i32(0).end().set(exDel);
+      return f.loadArr32(G.remIns, ny).get(exIns).op(OP.i32_add).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl)
+        .get(lim1).get(kL).op(OP.i32_add).op(OP.i32_le_s)
+        .loadArr32(G.remDel, nx).get(exDel).op(OP.i32_add).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl)
+        .get(lim2).get(kL).op(OP.i32_sub).op(OP.i32_le_s)
+        .op(OP.i32_and);
+    };
+
     f.get(x0).get(n).op(OP.i32_lt_s).get(x0).get(m).op(OP.i32_lt_s).op(OP.i32_or).if_();
     f.i32(1).set(d);
-    f.block(); // outer break block
-    f.loop();
+    f.block().loop();
     f.get(d).get(U).op(OP.i32_gt_s).br_if(1);
     f.get(U).get(d).op(OP.i32_sub).set(remD);
     f.get(remD).get(delta).op(OP.i32_sub).set(lim1);
@@ -1022,13 +1077,14 @@ export function buildDiffWasm() {
     f.get(hitBound).op(OP.i32_eqz).if_();
     f.get(iLo).set(idx).get(loK).set(k);
     f.get(idx).op(OP.i32_eqz).if_();
-    f.gget(G.Vp).load32(0).set(nx);
+    f.get(vpBase).load32(0).set(nx);
     f.get(nx).i32(0).op(OP.i32_lt_s).if_();
-    f.gget(G.Vc).i32(-2).store32(0);
+    f.get(vcBase).i32(-2).store32(0);
     f.else_();
     f.get(nx).get(k).op(OP.i32_sub).set(ny);
     f.block().loop();
-    f.loadArr32(G.A, nx).loadArr32(G.B, ny).op(OP.i32_ne).br_if(1);
+    f.get(aBase).get(nx).i32(2).op(OP.i32_shl).op(OP.i32_add).load32()
+      .get(bBase).get(ny).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().op(OP.i32_ne).br_if(1);
     f.get(nx).i32(1).op(OP.i32_add).set(nx);
     f.get(ny).i32(1).op(OP.i32_add).set(ny);
     f.br(0).end().end();
@@ -1038,27 +1094,27 @@ export function buildDiffWasm() {
     f.get(d).gset(G.ansD).get(k).gset(G.ansK).br(6);
     f.end();
     f.end();
-    f.gget(G.Vc).get(nx).store32(0);
+    f.get(vcBase).get(nx).store32(0);
     f.end();
     f.i32(1).set(idx).get(k).i32(2).op(OP.i32_add).set(k);
     f.end();
 
     f.get(iHi).get(d).get(iHi).get(d).op(OP.i32_lt_s).op(OP.select).set(endIdx);
     f.get(endIdx).get(d).op(OP.i32_eq).if_().get(d).i32(1).op(OP.i32_sub).set(endIdx).end();
-    f.get(idx).i32(1).op(OP.i32_sub).set(tmp);
-    f.loadArr32(G.Vp, tmp).set(xRem);
+    f.get(vpBase).get(idx).i32(1).op(OP.i32_sub).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().set(xRem);
 
     f.block().loop();
     f.get(idx).get(endIdx).op(OP.i32_gt_s).br_if(1);
-    f.loadArr32(G.Vp, idx).set(xAdd);
+    f.get(vpBase).get(idx).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().set(xAdd);
     f.get(xRem).i32(0).op(OP.i32_ge_s).get(xRem).i32(1).op(OP.i32_add).tee(tmp).get(xAdd).op(OP.i32_ge_s).op(OP.i32_and)
       .if_(I32).get(tmp).else_().get(xAdd).end().set(nx);
     f.get(nx).i32(0).op(OP.i32_lt_s).if_();
-    f.storeArr32(G.Vc, idx, () => f.i32(-2));
+    f.get(vcBase).get(idx).i32(2).op(OP.i32_shl).op(OP.i32_add).i32(-2).store32();
     f.else_();
     f.get(nx).get(k).op(OP.i32_sub).set(ny);
     f.block().loop();
-    f.loadArr32(G.A, nx).loadArr32(G.B, ny).op(OP.i32_ne).br_if(1);
+    f.get(aBase).get(nx).i32(2).op(OP.i32_shl).op(OP.i32_add).load32()
+      .get(bBase).get(ny).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().op(OP.i32_ne).br_if(1);
     f.get(nx).i32(1).op(OP.i32_add).set(nx);
     f.get(ny).i32(1).op(OP.i32_add).set(ny);
     f.br(0).end().end();
@@ -1068,7 +1124,7 @@ export function buildDiffWasm() {
     f.get(d).gset(G.ansD).get(k).gset(G.ansK).br(7);
     f.end();
     f.end();
-    f.storeArr32(G.Vc, idx, () => f.get(nx));
+    f.get(vcBase).get(idx).i32(2).op(OP.i32_shl).op(OP.i32_add).get(nx).store32();
     f.end();
     f.get(xAdd).set(xRem);
     f.get(idx).i32(1).op(OP.i32_add).set(idx);
@@ -1077,12 +1133,13 @@ export function buildDiffWasm() {
 
     f.get(iHi).get(d).op(OP.i32_eq).if_();
     f.get(xRem).i32(0).op(OP.i32_lt_s).if_();
-    f.storeArr32(G.Vc, d, () => f.i32(-2));
+    f.get(vcBase).get(d).i32(2).op(OP.i32_shl).op(OP.i32_add).i32(-2).store32();
     f.else_();
     f.get(xRem).i32(1).op(OP.i32_add).set(nx);
     f.get(nx).get(d).op(OP.i32_sub).set(ny);
     f.block().loop();
-    f.loadArr32(G.A, nx).loadArr32(G.B, ny).op(OP.i32_ne).br_if(1);
+    f.get(aBase).get(nx).i32(2).op(OP.i32_shl).op(OP.i32_add).load32()
+      .get(bBase).get(ny).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().op(OP.i32_ne).br_if(1);
     f.get(nx).i32(1).op(OP.i32_add).set(nx);
     f.get(ny).i32(1).op(OP.i32_add).set(ny);
     f.br(0).end().end();
@@ -1092,56 +1149,49 @@ export function buildDiffWasm() {
     f.get(d).gset(G.ansD).get(d).gset(G.ansK).br(6);
     f.end();
     f.end();
-    f.storeArr32(G.Vc, d, () => f.get(nx));
+    f.get(vcBase).get(d).i32(2).op(OP.i32_shl).op(OP.i32_add).get(nx).store32();
     f.end();
     f.end();
 
     f.else_();
-    // hitBound branch
     f.get(iLo).set(idx).get(loK).set(k);
     f.block().loop();
     f.get(idx).get(iHi).op(OP.i32_gt_s).br_if(1);
-    f.get(idx).i32(0).op(OP.i32_gt_s).if_(I32).get(idx).i32(1).op(OP.i32_sub).set(tmp).loadArr32(G.Vp, tmp).else_().i32(-2).end().set(xRem);
-    f.get(idx).get(d).op(OP.i32_lt_s).if_(I32).loadArr32(G.Vp, idx).else_().i32(-2).end().set(xAdd);
+    f.get(idx).i32(0).op(OP.i32_gt_s).if_(I32).get(vpBase).get(idx).i32(1).op(OP.i32_sub).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().else_().i32(-2).end().set(xRem);
+    f.get(idx).get(d).op(OP.i32_lt_s).if_(I32).get(vpBase).get(idx).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().else_().i32(-2).end().set(xAdd);
     f.get(xRem).i32(0).op(OP.i32_ge_s).get(xRem).get(n).op(OP.i32_lt_s).op(OP.i32_and).set(canRem);
     f.get(xAdd).i32(0).op(OP.i32_ge_s).get(xAdd).get(k).op(OP.i32_sub).i32(1).op(OP.i32_sub).get(m).op(OP.i32_lt_s).op(OP.i32_and).set(canAdd);
     f.get(canRem).get(canAdd).op(OP.i32_eqz).get(xRem).i32(1).op(OP.i32_add).get(xAdd).op(OP.i32_ge_s).op(OP.i32_or).op(OP.i32_and)
       .if_(I32).get(xRem).i32(1).op(OP.i32_add)
       .else_().get(canAdd).if_(I32).get(xAdd).else_().i32(-2).end().end().set(nx);
     f.get(nx).i32(0).op(OP.i32_lt_s).if_();
-    f.storeArr32(G.Vc, idx, () => f.i32(-2));
+    f.get(vcBase).get(idx).i32(2).op(OP.i32_shl).op(OP.i32_add).i32(-2).store32();
     f.else_();
     f.get(nx).get(k).op(OP.i32_sub).set(ny);
     f.block().loop();
-    f.loadArr32(G.A, nx).loadArr32(G.B, ny).op(OP.i32_ne).br_if(1);
+    f.get(aBase).get(nx).i32(2).op(OP.i32_shl).op(OP.i32_add).load32()
+      .get(bBase).get(ny).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().op(OP.i32_ne).br_if(1);
     f.get(nx).i32(1).op(OP.i32_add).set(nx);
     f.get(ny).i32(1).op(OP.i32_add).set(ny);
     f.br(0).end().end();
     f.get(nx).get(n).op(OP.i32_eq).get(ny).get(m).op(OP.i32_eq).op(OP.i32_and).if_();
     f.get(d).gset(G.ansD).get(k).gset(G.ansK).br(6);
     f.end();
-    f.storeArr32(G.Vc, idx, () => f.get(nx));
+    f.get(vcBase).get(idx).i32(2).op(OP.i32_shl).op(OP.i32_add).get(nx).store32();
     f.end();
     f.get(idx).i32(1).op(OP.i32_add).set(idx);
     f.get(k).i32(2).op(OP.i32_add).set(k);
     f.br(0).end().end();
-    f.end(); // end hitBound else
+    f.end();
 
-    // Outer edge A* pruning
-    const emitTrimSide = (idxL, kL, stepIdx, stepK, cmpOp) => {
+    const emitTrimSide = (idxL, kL, stepIdx, stepK) => {
       f.block().loop();
       f.get(iLo).get(iHi).op(OP.i32_gt_s).br_if(1);
-      f.loadArr32(G.Vc, idxL).set(nx);
+      f.get(vcBase).get(idxL).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().set(nx);
       f.get(nx).i32(0).op(OP.i32_ge_s).if_();
       f.get(nx).get(kL).op(OP.i32_sub).set(ny);
-      f.get(nx).i32(6).op(OP.i32_shl).get(n).op(OP.i32_add).i32(1).op(OP.i32_sub).get(n).op(OP.i32_div_u).set(qx);
-      f.get(ny).i32(6).op(OP.i32_shl).get(m).op(OP.i32_add).i32(1).op(OP.i32_sub).get(m).op(OP.i32_div_u).set(qy);
-      f.get(qx).i32(65).op(OP.i32_mul).get(qy).op(OP.i32_add).set(tmp);
-      f.loadArr32(G.grid64, tmp).set(cc);
-      f.loadArr32(G.remIns, ny).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl).get(lim1).get(kL).op(OP.i32_add).op(OP.i32_le_s)
-        .loadArr32(G.remDel, nx).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl).get(lim2).get(kL).op(OP.i32_sub).op(OP.i32_le_s)
-        .op(OP.i32_and).br_if(2);
-      f.storeArr32(G.Vc, idxL, () => f.i32(-2));
+      emitIsValid(kL).br_if(2);
+      f.get(vcBase).get(idxL).i32(2).op(OP.i32_shl).op(OP.i32_add).i32(-2).store32();
       f.end();
       f.get(idxL).i32(stepIdx).op(OP.i32_add).set(idxL);
       f.get(kL).i32(stepK).op(OP.i32_add).set(kL);
@@ -1151,7 +1201,7 @@ export function buildDiffWasm() {
     emitTrimSide(iHi, hiK, -1, -2);
 
     f.get(loK).set(kLo).get(hiK).set(kHi);
-    f.gget(G.Vp).set(tmp).gget(G.Vc).gset(G.Vp).get(tmp).gset(G.Vc);
+    f.get(vpBase).set(tmp).get(vcBase).tee(vpBase).gset(G.Vp).get(tmp).tee(vcBase).gset(G.Vc);
 
     f.get(d).get(bMask).op(OP.i32_and).op(OP.i32_eqz).if_();
     f.get(iHi).get(iLo).op(OP.i32_sub).i32(1).op(OP.i32_add).i32(2).op(OP.i32_shl).set(bytesNeed);
@@ -1174,21 +1224,21 @@ export function buildDiffWasm() {
 
     f.get(d).i32(1).op(OP.i32_add).set(d);
     f.br(0).end().end();
-    f.end(); // if x0<n||x0<m
+    f.end();
   });
 
-  // ------------------------------------------------------------------ 9. replayPath()
+  // ------------------------------------------------------------------ replayPath()
   addFunc(F.replayPath, [], [], (f) => {
     const n = f.loc(), m = f.loc(), U = f.loc(), delta = f.loc(), ansD = f.loc(), ptr = f.loc();
     const bShift = f.loc(), bStep = f.loc(), stride = f.loc(), opLen = f.loc();
     const curD = f.loc(), curK = f.loc(), curX = f.loc();
-    const bIdx = f.loc(), d0 = f.loc(), d1 = f.loc(), span = f.loc();
+    const bIdx = f.loc(), d0 = f.loc(), span = f.loc();
     const metaPtr = f.loc(), ckData = f.loc(), ckILo = f.loc(), fLo0 = f.loc(), fHi0 = f.loc();
     const baseK0 = f.loc(), rLo0 = f.loc(), rHi0 = f.loc(), k = f.loc();
     const pLo = f.loc(), pHi = f.loc(), s = f.loc(), d = f.loc(), remD = f.loc(), lim1 = f.loc(), lim2 = f.loc();
     const wLo = f.loc(), wHi = f.loc(), rLo = f.loc(), rHi = f.loc(), prevRow = f.loc(), curRow = f.loc(), shiftBase = f.loc();
     const cILo = f.loc(), cIHi = f.loc(), col = f.loc(), xRem = f.loc(), xAdd = f.loc(), canRem = f.loc(), canAdd = f.loc(), nx = f.loc(), ny = f.loc();
-    const qx = f.loc(), qy = f.loc(), cc = f.loc(), tmp = f.loc();
+    const qx = f.loc(), qy = f.loc(), cc = f.loc(), pa = f.loc(), pb = f.loc(), exIns = f.loc(), exDel = f.loc(), tmp = f.loc();
     const traceX = f.loc(), traceK = f.loc(), startX = f.loc(), opK = f.loc(), nextK = f.loc(), prevX = f.loc(), keep = f.loc();
 
     f.gget(G.n).set(n).gget(G.m).set(m).gget(G.U).set(U).gget(G.ansD).set(ansD);
@@ -1196,7 +1246,6 @@ export function buildDiffWasm() {
     f.gget(G.bShift).set(bShift).gget(G.bStep).set(bStep);
     f.get(bStep).i32(4).op(OP.i32_add).set(stride);
 
-    // Arena for revKind, revCount, changes, hunks
     f.gget(G.ckptDataPtr).i32(7).op(OP.i32_add).i32(-8).op(OP.i32_and).set(ptr);
     f.get(ptr).gset(G.revKind);
     f.get(ptr).get(ansD).i32(1).op(OP.i32_shl).i32(16).op(OP.i32_add).i32(7).op(OP.i32_add).i32(-8).op(OP.i32_and).op(OP.i32_add).set(ptr);
@@ -1318,8 +1367,12 @@ export function buildDiffWasm() {
       f.get(ny).i32(6).op(OP.i32_shl).get(m).op(OP.i32_add).i32(1).op(OP.i32_sub).get(m).op(OP.i32_div_u).set(qy);
       f.get(qx).i32(65).op(OP.i32_mul).get(qy).op(OP.i32_add).set(cc);
       f.loadArr32(G.grid64, cc).set(cc);
-      f.loadArr32(G.remIns, ny).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl).get(lim1).get(kL).op(OP.i32_add).op(OP.i32_le_s)
-        .loadArr32(G.remDel, nx).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl).get(lim2).get(kL).op(OP.i32_sub).op(OP.i32_le_s)
+      f.loadArr32(G.prefUniqA, nx).set(pa);
+      f.loadArr32(G.prefUniqB, ny).set(pb);
+      f.get(pa).get(pb).op(OP.i32_gt_s).if_(I32).get(pa).get(pb).op(OP.i32_sub).else_().i32(0).end().set(exIns);
+      f.get(pb).get(pa).op(OP.i32_gt_s).if_(I32).get(pb).get(pa).op(OP.i32_sub).else_().i32(0).end().set(exDel);
+      f.loadArr32(G.remIns, ny).get(exIns).op(OP.i32_add).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl).get(lim1).get(kL).op(OP.i32_add).op(OP.i32_le_s)
+        .loadArr32(G.remDel, nx).get(exDel).op(OP.i32_add).get(cc).op(OP.i32_add).i32(1).op(OP.i32_shl).get(lim2).get(kL).op(OP.i32_sub).op(OP.i32_le_s)
         .op(OP.i32_and).br_if(2);
       f.storeArr32(G.repBuf, tmp, () => f.i32(-2));
       f.end();
@@ -1335,7 +1388,6 @@ export function buildDiffWasm() {
     f.get(s).i32(1).op(OP.i32_add).set(s);
     f.br(0).end().end();
 
-    // Trace backwards from s = span down to 1
     f.get(curX).set(traceX).get(curK).set(traceK).get(span).set(s);
     f.block().loop();
     f.get(s).i32(1).op(OP.i32_lt_s).br_if(1);
@@ -1370,7 +1422,7 @@ export function buildDiffWasm() {
     f.get(opLen).gset(G.opLen);
   });
 
-  // ------------------------------------------------------------------ 10. buildChangesAndHunks()
+  // ------------------------------------------------------------------ buildChangesAndHunks()
   addFunc(F.buildChangesAndHunks, [], [], (f) => {
     const opLen = f.loc(), ptr = f.loc(), idx = f.loc(), kind = f.loc(), cnt = f.loc();
     const o = f.loc(), p = f.loc(), del = f.loc(), ins = f.loc(), nc = f.loc(), last = f.loc();
@@ -1446,7 +1498,7 @@ export function buildDiffWasm() {
     f.get(nh).gset(G.numHunks);
   });
 
-  // ------------------------------------------------------------------ 11. writeDec(outPtr, val) -> newOutPtr
+  // ------------------------------------------------------------------ writeDec(outPtr, val) -> newOutPtr
   addFunc(F.writeDec, [I32, I32], [I32], (f) => {
     const ptr = 0, val = 1;
     const start = f.loc(), lo = f.loc(), hi = f.loc(), t = f.loc();
@@ -1473,10 +1525,7 @@ export function buildDiffWasm() {
     f.get(ptr);
   });
 
-  // ------------------------------------------------------------------ 12. writeStrConst (helper unused; inline byte stores are tiny)
-  addFunc(F.writeStrConst, [I32], [I32], (f) => f.get(0));
-
-  // ------------------------------------------------------------------ 13. pushLineOut(outPtr, base, s, e, opByte) -> newOutPtr
+  // ------------------------------------------------------------------ pushLineOut(outPtr, base, s, e, opByte) -> newOutPtr
   addFunc(F.pushLineOut, [I32, I32, I32, I32, I32], [I32], (f) => {
     const out = 0, base = 1, s = 2, e = 3, opB = 4;
     const len = f.loc();
@@ -1486,7 +1535,6 @@ export function buildDiffWasm() {
     f.get(out).get(base).get(s).op(OP.i32_add).get(len).memCopy();
     f.get(out).get(len).op(OP.i32_add).set(out);
     f.get(base).get(e).op(OP.i32_add).i32(1).op(OP.i32_sub).load8().i32(10).op(OP.i32_ne).if_();
-    // Write "\n%\n"
     f.get(out).i32(10).store8(0);
     f.get(out).i32(37).store8(1);
     f.get(out).i32(10).store8(2);
@@ -1495,7 +1543,7 @@ export function buildDiffWasm() {
     f.get(out);
   });
 
-  // ------------------------------------------------------------------ 14. buildPatch()
+  // ------------------------------------------------------------------ buildPatch()
   addFunc(F.buildPatch, [], [], (f) => {
     const outBase = f.loc(), ptr = f.loc(), totalOld = f.loc(), totalNew = f.loc();
     const prefix = f.loc(), suffix = f.loc(), n = f.loc(), m = f.loc(), nh = f.loc();
@@ -1511,19 +1559,16 @@ export function buildDiffWasm() {
     f.get(prefix).get(m).op(OP.i32_add).get(suffix).op(OP.i32_add).set(totalNew);
     f.gget(G.oBase).set(oBase).gget(G.nBase).set(nBase).gget(G.oStart).set(oStart).gget(G.oEnd).set(oEnd).gget(G.oLen).set(oLen);
 
-    // Reserve preArr (16 bytes) and sufArr (16 bytes) + outBuf
     f.gget(G.arenaPtr).set(ptr);
     f.get(ptr).set(preArr); f.get(ptr).i32(16).op(OP.i32_add).set(ptr);
     f.get(ptr).set(sufArr); f.get(ptr).i32(16).op(OP.i32_add).set(ptr);
     f.get(ptr).tee(outBase).gset(G.outBase);
-    // Max output bytes: oLen + nLen + totalOld*4 + totalNew*4 + nh*64 + 512
     f.get(oLen).gget(G.nLen).op(OP.i32_add)
       .get(totalOld).get(totalNew).op(OP.i32_add).i32(2).op(OP.i32_shl).op(OP.i32_add)
       .get(nh).i32(6).op(OP.i32_shl).op(OP.i32_add)
       .i32(512).op(OP.i32_add).set(maxBytes);
     f.get(outBase).get(maxBytes).op(OP.i32_add).call(F.ensureMem);
 
-    // Emit header: "makefun-diff/1 old="
     f.get(outBase).set(ptr);
     const emitBytes = (str) => {
       for (let k = 0; k < str.length; k++) f.get(ptr).i32(str.charCodeAt(k)).store8(k);
@@ -1544,7 +1589,6 @@ export function buildDiffWasm() {
 
     f.get(nh).op(OP.i32_eqz).if_().get(ptr).gset(G.outEnd).ret().end();
 
-    // Compute preArr (up to 3 context lines before oStart) if needed
     f.i32(0).set(preNeed);
     f.gget(G.changesO).load32(0).get(prefix).i32(3).op(OP.i32_add).op(OP.i32_lt_s).get(prefix).i32(0).op(OP.i32_gt_s).op(OP.i32_and).if_();
     f.get(prefix).i32(3).get(prefix).i32(3).op(OP.i32_lt_s).op(OP.select).set(preNeed);
@@ -1565,7 +1609,6 @@ export function buildDiffWasm() {
     f.br(0).end().end();
     f.end();
 
-    // Compute sufArr (up to 3 context lines after oEnd) if needed
     f.i32(0).set(sufNeed);
     f.get(suffix).i32(0).op(OP.i32_gt_s).if_();
     f.gget(G.hEnd).get(nh).i32(1).op(OP.i32_sub).i32(2).op(OP.i32_shl).op(OP.i32_add).load32().set(li);
@@ -1646,7 +1689,7 @@ export function buildDiffWasm() {
 
     f.block().loop();
     f.get(at).get(co).op(OP.i32_ge_s).br_if(1);
-    emitPushOld(at, 61); // '='
+    emitPushOld(at, 61);
     f.get(at).i32(1).op(OP.i32_add).set(at);
     f.br(0).end().end();
 
@@ -1654,7 +1697,7 @@ export function buildDiffWasm() {
     f.block().loop();
     f.get(i).get(cd).op(OP.i32_ge_s).br_if(1);
     f.get(co).get(i).op(OP.i32_add).set(at);
-    emitPushOld(at, 45); // '-'
+    emitPushOld(at, 45);
     f.get(i).i32(1).op(OP.i32_add).set(i);
     f.br(0).end().end();
 
@@ -1662,7 +1705,7 @@ export function buildDiffWasm() {
     f.block().loop();
     f.get(i).get(cins).op(OP.i32_ge_s).br_if(1);
     f.get(cp).get(i).op(OP.i32_add).get(prefix).op(OP.i32_sub).set(mi);
-    f.get(ptr).get(nBase).loadArr32(G.nStarts, mi).loadArr32(G.nEnds, mi).i32(43).call(F.pushLineOut).set(ptr); // '+'
+    f.get(ptr).get(nBase).loadArr32(G.nStarts, mi).loadArr32(G.nEnds, mi).i32(43).call(F.pushLineOut).set(ptr);
     f.get(i).i32(1).op(OP.i32_add).set(i);
     f.br(0).end().end();
 
@@ -1672,7 +1715,7 @@ export function buildDiffWasm() {
 
     f.block().loop();
     f.get(at).get(oldEnd).op(OP.i32_ge_s).br_if(1);
-    emitPushOld(at, 61); // '='
+    emitPushOld(at, 61);
     f.get(at).i32(1).op(OP.i32_add).set(at);
     f.br(0).end().end();
 
@@ -1681,12 +1724,12 @@ export function buildDiffWasm() {
     f.get(ptr).gset(G.outEnd);
   });
 
-  // ------------------------------------------------------------------ 15. solveAscii() -> outLen
+  // ------------------------------------------------------------------ solveAscii() -> outLen
   addFunc(F.solveAscii, [], [I32], (f) => {
     f.call(F.trimPrefixSuffix);
     f.gget(G.oStart).gget(G.oEnd).op(OP.i32_eq).gget(G.nStart).gget(G.nEnd).op(OP.i32_eq).op(OP.i32_and).if_();
     f.i32(0).gset(G.n).i32(0).gset(G.m).i32(0).gset(G.numHunks).i32(0).gset(G.deleted).i32(0).gset(G.inserted);
-    f.gget(G.nBase).gget(G.nLen).op(OP.i32_add).i32(31).op(OP.i32_add).i32(-8).op(OP.i32_and).gset(G.arenaPtr);
+    f.gget(G.arenaBase).gset(G.arenaPtr);
     f.call(F.buildPatch);
     f.gget(G.outEnd).gget(G.outBase).op(OP.i32_sub).ret();
     f.end();
@@ -1715,81 +1758,500 @@ export function buildDiffWasm() {
   });
 
   addFunc(F.getOutBase, [], [I32], (f) => f.gget(G.outBase));
+  addFunc(F.getBatchOutBase, [], [I32], (f) => f.gget(G.batchOutBase));
 
-  // Encode WASM module
-  const bytes = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+  // ------------------------------------------------------------------ skipWs(pos, end) -> pos
+  addFunc(F.skipWs, [I32, I32], [I32], (f) => {
+    const pos = 0, end = 1, b = f.loc();
+    f.block().loop();
+    f.get(pos).get(end).op(OP.i32_ge_u).br_if(1);
+    f.get(pos).load8().tee(b);
+    f.i32(32).op(OP.i32_eq)
+      .get(b).i32(9).op(OP.i32_eq).op(OP.i32_or)
+      .get(b).i32(10).op(OP.i32_eq).op(OP.i32_or)
+      .get(b).i32(13).op(OP.i32_eq).op(OP.i32_or)
+      .op(OP.i32_eqz).br_if(1);
+    f.get(pos).i32(1).op(OP.i32_add).set(pos);
+    f.br(0).end().end();
+    f.get(pos);
+  });
+
+  // ------------------------------------------------------------------ skipJsonStr(pos, end) -> newPos or -1
+  addFunc(F.skipJsonStr, [I32, I32], [I32], (f) => {
+    const pos = 0, end = 1, b = f.loc();
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(34).op(OP.i32_ne).if_().i32(-1).ret().end();
+    f.get(pos).i32(1).op(OP.i32_add).set(pos);
+    f.block().loop();
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().set(b);
+    f.get(b).i32(34).op(OP.i32_eq).if_().get(pos).i32(1).op(OP.i32_add).ret().end();
+    f.get(b).i32(92).op(OP.i32_eq).if_();
+    f.get(pos).i32(1).op(OP.i32_add).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).i32(1).op(OP.i32_add).load8().i32(117).op(OP.i32_eq).if_(); // '\u' -> fallback if non-ascii possible, skip 6 or check
+    f.get(pos).i32(2).op(OP.i32_add).set(pos);
+    f.else_();
+    f.get(pos).i32(2).op(OP.i32_add).set(pos);
+    f.end();
+    f.br(1);
+    f.end();
+    f.get(b).i32(32).op(OP.i32_lt_u).get(b).i32(127).op(OP.i32_gt_u).op(OP.i32_or).if_().i32(-1).ret().end();
+    f.get(pos).i32(1).op(OP.i32_add).set(pos);
+    f.br(0).end().end();
+    f.i32(-1);
+  });
+
+  // ------------------------------------------------------------------ unescapeJsonStr(src, end, dstBase) -> len or -1 (updates G.jsonCur)
+  addFunc(F.unescapeJsonStr, [I32, I32, I32], [I32], (f) => {
+    const src = 0, end = 1, dstBase = 2;
+    const dst = f.loc(), end16 = f.loc(), mask = f.loc(), k = f.loc(), b = f.loc(), esc = f.loc(), h1 = f.loc(), h2 = f.loc();
+    const q16 = f.loc(V128), bs16 = f.loc(V128), sp16 = f.loc(V128), v = f.loc(V128);
+
+    f.get(src).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(src).load8().i32(34).op(OP.i32_ne).if_().i32(-1).ret().end();
+    f.get(src).i32(1).op(OP.i32_add).set(src);
+    f.get(dstBase).set(dst);
+    f.get(end).i32(16).op(OP.i32_sub).set(end16);
+    f.i32(34).vsplat8().set(q16);
+    f.i32(92).vsplat8().set(bs16);
+    f.i32(32).vsplat8().set(sp16);
+
+    const emitHex = (chL, outL) => {
+      f.get(chL).i32(48).op(OP.i32_sub).tee(outL).i32(9).op(OP.i32_le_u).if_();
+      f.else_();
+      f.get(chL).i32(32).op(OP.i32_or).i32(87).op(OP.i32_sub).tee(outL);
+      f.i32(10).op(OP.i32_lt_u).get(outL).i32(15).op(OP.i32_gt_u).op(OP.i32_or).if_().i32(-1).ret().end();
+      f.end();
+    };
+
+    const emitHandleEsc = () => {
+      f.get(src).i32(1).op(OP.i32_add).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+      f.get(src).i32(1).op(OP.i32_add).load8().set(esc);
+      f.get(esc).i32(34).op(OP.i32_eq).if_().get(dst).i32(34).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(92).op(OP.i32_eq).if_().get(dst).i32(92).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(110).op(OP.i32_eq).if_().get(dst).i32(10).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(114).op(OP.i32_eq).if_().get(dst).i32(13).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(116).op(OP.i32_eq).if_().get(dst).i32(9).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(98).op(OP.i32_eq).if_().get(dst).i32(8).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(102).op(OP.i32_eq).if_().get(dst).i32(12).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(47).op(OP.i32_eq).if_().get(dst).i32(47).store8().get(src).i32(2).op(OP.i32_add).set(src).get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().get(esc).i32(117).op(OP.i32_eq).if_();
+      // \u00XX where XX < 0x80
+      f.get(src).i32(5).op(OP.i32_add).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+      f.get(src).load8(2).i32(48).op(OP.i32_ne).get(src).load8(3).i32(48).op(OP.i32_ne).op(OP.i32_or).if_().i32(-1).ret().end();
+      f.get(src).load8(4).set(b); emitHex(b, h1);
+      f.get(h1).i32(7).op(OP.i32_gt_u).if_().i32(-1).ret().end();
+      f.get(src).load8(5).set(b); emitHex(b, h2);
+      f.get(dst).get(h1).i32(4).op(OP.i32_shl).get(h2).op(OP.i32_or).store8();
+      f.get(src).i32(6).op(OP.i32_add).set(src);
+      f.get(dst).i32(1).op(OP.i32_add).set(dst);
+      f.else_().i32(-1).ret().end();
+      f.end().end().end().end().end().end().end().end();
+    };
+
+    // SIMD128 16-byte loop
+    f.block().loop();
+    f.get(src).get(end16).op(OP.i32_gt_s).br_if(1);
+    f.get(src).vload().tee(v);
+    f.get(v).get(q16).veq8()
+      .get(v).get(bs16).veq8().vor()
+      .get(v).get(sp16).vlts8().vor()
+      .vbitmask8().tee(mask).op(OP.i32_eqz).if_();
+    f.get(dst).get(v).vstore();
+    f.get(src).i32(16).op(OP.i32_add).set(src);
+    f.get(dst).i32(16).op(OP.i32_add).set(dst);
+    f.br(1);
+    f.end();
+    f.get(mask).op(OP.i32_ctz).tee(k).if_();
+    f.get(dst).get(v).vstore();
+    f.get(src).get(k).op(OP.i32_add).set(src);
+    f.get(dst).get(k).op(OP.i32_add).set(dst);
+    f.end();
+    f.get(src).load8().set(b);
+    f.get(b).i32(34).op(OP.i32_eq).if_();
+    f.get(src).i32(1).op(OP.i32_add).gset(G.jsonCur);
+    f.get(dst).get(dstBase).op(OP.i32_sub).ret();
+    f.end();
+    f.get(b).i32(92).op(OP.i32_ne).if_().i32(-1).ret().end();
+    emitHandleEsc();
+    f.br(0).end().end();
+
+    // Byte tail (< 16 bytes remaining)
+    f.block().loop();
+    f.get(src).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(src).load8().set(b);
+    f.get(b).i32(34).op(OP.i32_eq).if_();
+    f.get(src).i32(1).op(OP.i32_add).gset(G.jsonCur);
+    f.get(dst).get(dstBase).op(OP.i32_sub).ret();
+    f.end();
+    f.get(b).i32(92).op(OP.i32_eq).if_();
+    emitHandleEsc();
+    f.br(1);
+    f.end();
+    f.get(b).i32(32).op(OP.i32_lt_u).get(b).i32(127).op(OP.i32_gt_u).op(OP.i32_or).if_().i32(-1).ret().end();
+    f.get(dst).get(b).store8();
+    f.get(src).i32(1).op(OP.i32_add).set(src);
+    f.get(dst).i32(1).op(OP.i32_add).set(dst);
+    f.br(0).end().end();
+    f.i32(-1);
+  });
+
+  // ------------------------------------------------------------------ escapeJsonOut(src, len, dst) -> newDst (SIMD128)
+  addFunc(F.escapeJsonOut, [I32, I32, I32], [I32], (f) => {
+    const src = 0, len = 1, dst = 2;
+    const end = f.loc(), end16 = f.loc(), mask = f.loc(), k = f.loc(), b = f.loc(), h1 = f.loc(), h2 = f.loc();
+    const q16 = f.loc(V128), bs16 = f.loc(V128), sp16 = f.loc(V128), v = f.loc(V128);
+
+    f.get(dst).i32(34).store8();
+    f.get(dst).i32(1).op(OP.i32_add).set(dst);
+    f.get(src).get(len).op(OP.i32_add).tee(end).i32(16).op(OP.i32_sub).set(end16);
+    f.i32(34).vsplat8().set(q16);
+    f.i32(92).vsplat8().set(bs16);
+    f.i32(32).vsplat8().set(sp16);
+
+    const emitEscByte = () => {
+      f.get(b).i32(10).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(110).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_().get(b).i32(34).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(34).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_().get(b).i32(92).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(92).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_().get(b).i32(13).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(114).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_().get(b).i32(9).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(116).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_().get(b).i32(8).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(98).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_().get(b).i32(12).op(OP.i32_eq).if_().get(dst).i32(92).store8(0).get(dst).i32(102).store8(1).get(dst).i32(2).op(OP.i32_add).set(dst);
+      f.else_();
+      // \u00XX
+      f.get(dst).i32(92).store8(0).get(dst).i32(117).store8(1).get(dst).i32(48).store8(2).get(dst).i32(48).store8(3);
+      f.get(b).i32(4).op(OP.i32_shr_u).i32(48).op(OP.i32_add).set(h1);
+      f.get(b).i32(15).op(OP.i32_and).tee(h2).i32(10).op(OP.i32_lt_u).if_(I32).get(h2).i32(48).op(OP.i32_add).else_().get(h2).i32(87).op(OP.i32_add).end().set(h2);
+      f.get(dst).get(h1).store8(4).get(dst).get(h2).store8(5).get(dst).i32(6).op(OP.i32_add).set(dst);
+      f.end().end().end().end().end().end().end();
+    };
+
+    f.block().loop();
+    f.get(src).get(end16).op(OP.i32_gt_s).br_if(1);
+    f.get(src).vload().tee(v);
+    f.get(v).get(q16).veq8()
+      .get(v).get(bs16).veq8().vor()
+      .get(v).get(sp16).vlts8().vor()
+      .vbitmask8().tee(mask).op(OP.i32_eqz).if_();
+    f.get(dst).get(v).vstore();
+    f.get(src).i32(16).op(OP.i32_add).set(src);
+    f.get(dst).i32(16).op(OP.i32_add).set(dst);
+    f.br(1);
+    f.end();
+    f.get(mask).op(OP.i32_ctz).tee(k).if_();
+    f.get(dst).get(v).vstore();
+    f.get(src).get(k).op(OP.i32_add).set(src);
+    f.get(dst).get(k).op(OP.i32_add).set(dst);
+    f.end();
+    f.get(src).load8().set(b);
+    f.get(src).i32(1).op(OP.i32_add).set(src);
+    emitEscByte();
+    f.br(0).end().end();
+
+    f.block().loop();
+    f.get(src).get(end).op(OP.i32_ge_u).br_if(1);
+    f.get(src).load8().set(b);
+    f.get(src).i32(1).op(OP.i32_add).set(src);
+    f.get(b).i32(34).op(OP.i32_eq).get(b).i32(92).op(OP.i32_eq).op(OP.i32_or).get(b).i32(32).op(OP.i32_lt_u).op(OP.i32_or).if_();
+    emitEscByte();
+    f.else_();
+    f.get(dst).get(b).store8();
+    f.get(dst).i32(1).op(OP.i32_add).set(dst);
+    f.end();
+    f.br(0).end().end();
+
+    f.get(dst).i32(34).store8();
+    f.get(dst).i32(1).op(OP.i32_add);
+  });
+
+  // ------------------------------------------------------------------ solveBatchJson() -> batchOutLen or -1
+  addFunc(F.solveBatchJson, [], [I32], (f) => {
+    const end = f.loc(), pos = f.loc(), batchOutBase = f.loc(), batchPtr = f.loc(), caseIdx = f.loc();
+    const seenInput = f.loc(), oLen = f.loc(), nLen = f.loc(), oBase = f.loc(), nBase = f.loc();
+    const buf1 = f.loc(), len1 = f.loc(), outLen = f.loc(), outBase = f.loc(), outEnd = f.loc(), minBase = f.loc();
+    const tmpDst = f.loc(), tmpEnd = f.loc(), escLen = f.loc(), b = f.loc(), isOld = f.loc(), ab = f.loc();
+
+    f.gget(G.jsonLen).set(end);
+    f.i32(0).get(end).call(F.skipWs).set(pos);
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(91).op(OP.i32_ne).if_().i32(-1).ret().end(); // '['
+    f.get(pos).i32(1).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+
+    f.get(end).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).tee(batchOutBase).gset(G.batchOutBase);
+    f.get(batchOutBase).i32(1024).op(OP.i32_add).call(F.ensureMem);
+    f.get(batchOutBase).set(batchPtr);
+    f.get(batchPtr).i32(91).store8();
+    f.get(batchPtr).i32(1).op(OP.i32_add).set(batchPtr);
+
+    // Empty array []
+    f.get(pos).get(end).op(OP.i32_lt_u).if_();
+    f.get(pos).load8().i32(93).op(OP.i32_eq).if_();
+    f.get(pos).i32(1).op(OP.i32_add).get(end).call(F.skipWs).get(end).op(OP.i32_ne).if_().i32(-1).ret().end();
+    f.get(batchPtr).i32(93).store8();
+    f.get(batchPtr).i32(1).op(OP.i32_add).get(batchOutBase).op(OP.i32_sub).ret();
+    f.end();
+    f.end();
+
+    const expectByte = (ch) => {
+      f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+      f.get(pos).load8().i32(ch).op(OP.i32_ne).if_().i32(-1).ret().end();
+      f.get(pos).i32(1).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    };
+
+    f.i32(0).set(caseIdx);
+    f.block().loop();
+    f.get(caseIdx).i32(0).op(OP.i32_gt_s).if_();
+    f.get(batchPtr).i32(16).op(OP.i32_add).call(F.ensureMem);
+    f.get(batchPtr).i32(44).store8();
+    f.get(batchPtr).i32(1).op(OP.i32_add).set(batchPtr);
+    f.end();
+
+    expectByte(123); // '{'
+    f.i32(0).set(seenInput).i32(-1).set(oLen).i32(-1).set(nLen);
+
+    // Outer object keys
+    f.block().loop();
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(125).op(OP.i32_eq).br_if(1);
+
+    // Check key: "input" | "id" | "group"
+    f.get(pos).i32(7).op(OP.i32_add).get(end).op(OP.i32_le_u)
+      .if_(I32)
+      .get(pos).load32u(0).i32(0x706e6922).op(OP.i32_eq)
+      .get(pos).load32u(3).i32(0x22747570).op(OP.i32_eq).op(OP.i32_and)
+      .else_().i32(0).end()
+      .if_();
+    // "input"
+    f.get(seenInput).if_().i32(-1).ret().end();
+    f.i32(1).set(seenInput);
+    f.get(pos).i32(7).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    expectByte(58); // ':'
+    expectByte(123); // '{'
+
+    // Inner { "old": ..., "new": ... }
+    f.get(batchPtr).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).set(buf1);
+    f.i32(0).set(len1);
+    f.block().loop();
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(125).op(OP.i32_eq).br_if(1);
+    f.get(pos).i32(5).op(OP.i32_add).get(end).op(OP.i32_gt_u).if_().i32(-1).ret().end();
+    f.get(pos).load8(4).i32(34).op(OP.i32_ne).if_().i32(-1).ret().end();
+    f.get(pos).load32u(0).i32(0x646c6f22).op(OP.i32_eq).if_();
+    f.i32(1).set(isOld);
+    f.else_().get(pos).load32u(0).i32(0x77656e22).op(OP.i32_eq).if_();
+    f.i32(0).set(isOld);
+    f.else_().i32(-1).ret().end().end();
+
+    f.get(isOld).if_().get(oLen).i32(0).op(OP.i32_ge_s).if_().i32(-1).ret().end();
+    f.else_().get(nLen).i32(0).op(OP.i32_ge_s).if_().i32(-1).ret().end().end();
+
+    f.get(pos).i32(5).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    expectByte(58); // ':'
+
+    f.get(oLen).i32(0).op(OP.i32_lt_s).get(nLen).i32(0).op(OP.i32_lt_s).op(OP.i32_and).if_();
+    // First string goes at buf1
+    f.get(buf1).get(end).get(pos).op(OP.i32_sub).op(OP.i32_add).i32(64).op(OP.i32_add).call(F.ensureMem);
+    f.get(pos).get(end).get(buf1).call(F.unescapeJsonStr).tee(len1).i32(0).op(OP.i32_lt_s).if_().i32(-1).ret().end();
+    f.get(isOld).if_().get(buf1).set(oBase).get(len1).set(oLen);
+    f.else_().get(buf1).set(nBase).get(len1).set(nLen).end();
+    f.else_();
+    // Second string goes after buf1 + len1
+    f.get(buf1).get(len1).op(OP.i32_add).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).set(ab);
+    f.get(ab).get(end).get(pos).op(OP.i32_sub).op(OP.i32_add).i32(64).op(OP.i32_add).call(F.ensureMem);
+    f.get(pos).get(end).get(ab).call(F.unescapeJsonStr).tee(tmpEnd).i32(0).op(OP.i32_lt_s).if_().i32(-1).ret().end();
+    f.get(isOld).if_().get(ab).set(oBase).get(tmpEnd).set(oLen);
+    f.else_().get(ab).set(nBase).get(tmpEnd).set(nLen).end();
+    f.end();
+
+    f.gget(G.jsonCur).get(end).call(F.skipWs).set(pos);
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(44).op(OP.i32_eq).if_();
+    f.get(pos).i32(1).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    f.br(1);
+    f.end();
+    f.br(1).end().end();
+    expectByte(125); // '}'
+
+    f.else_();
+    // Check "id" or "group"
+    f.get(pos).i32(4).op(OP.i32_add).get(end).op(OP.i32_le_u)
+      .if_(I32).get(pos).load32u(0).i32(0x22646922).op(OP.i32_eq).else_().i32(0).end()
+      .if_();
+    f.get(pos).i32(4).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    f.else_().get(pos).i32(7).op(OP.i32_add).get(end).op(OP.i32_le_u)
+      .if_(I32).get(pos).load32u(0).i32(0x6f726722).op(OP.i32_eq).get(pos).load32u(3).i32(0x2270756f).op(OP.i32_eq).op(OP.i32_and).else_().i32(0).end()
+      .if_();
+    f.get(pos).i32(7).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    f.else_().i32(-1).ret().end().end();
+
+    expectByte(58); // ':'
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(34).op(OP.i32_eq).if_();
+    f.get(pos).get(end).call(F.skipJsonStr).tee(pos).i32(0).op(OP.i32_lt_s).if_().i32(-1).ret().end();
+    f.else_();
+    // Skip integer id
+    f.get(pos).load8().i32(45).op(OP.i32_eq).if_().get(pos).i32(1).op(OP.i32_add).set(pos).end();
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().tee(b).i32(48).op(OP.i32_lt_u).get(b).i32(57).op(OP.i32_gt_u).op(OP.i32_or).if_().i32(-1).ret().end();
+    f.block().loop();
+    f.get(pos).get(end).op(OP.i32_ge_u).br_if(1);
+    f.get(pos).load8().tee(b).i32(48).op(OP.i32_lt_u).get(b).i32(57).op(OP.i32_gt_u).op(OP.i32_or).br_if(1);
+    f.get(pos).i32(1).op(OP.i32_add).set(pos);
+    f.br(0).end().end();
+    f.end();
+    f.get(pos).get(end).call(F.skipWs).set(pos);
+    f.end();
+
+    f.get(pos).get(end).op(OP.i32_ge_u).if_().i32(-1).ret().end();
+    f.get(pos).load8().i32(44).op(OP.i32_eq).if_();
+    f.get(pos).i32(1).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    f.br(1);
+    f.end();
+    f.br(1).end().end();
+    expectByte(125); // '}'
+
+    f.get(seenInput).op(OP.i32_eqz).get(oLen).i32(0).op(OP.i32_lt_s).op(OP.i32_or).get(nLen).i32(0).op(OP.i32_lt_s).op(OP.i32_or).if_().i32(-1).ret().end();
+
+    // Solve current case in WASM
+    f.get(oBase).gset(G.oBase).get(oLen).gset(G.oLen).get(nBase).gset(G.nBase).get(nLen).gset(G.nLen);
+    f.get(oBase).get(oLen).op(OP.i32_add).tee(ab);
+    f.get(nBase).get(nLen).op(OP.i32_add).tee(tmpDst);
+    f.get(ab).get(tmpDst).op(OP.i32_gt_u).op(OP.select).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).gset(G.arenaBase);
+
+    f.call(F.solveAscii).set(outLen);
+    f.gget(G.outBase).set(outBase);
+    f.gget(G.outEnd).set(outEnd);
+
+    // Check if escaping directly to batchPtr cannot reach outBase
+    f.get(batchPtr).get(outLen).i32(6).op(OP.i32_mul).op(OP.i32_add).i32(64).op(OP.i32_add).get(outBase).op(OP.i32_le_u).if_();
+    f.get(outBase).get(outLen).get(batchPtr).call(F.escapeJsonOut).set(batchPtr);
+    f.else_();
+    f.get(outEnd).i32(31).op(OP.i32_add).i32(-16).op(OP.i32_and).set(tmpDst);
+    f.get(tmpDst).get(outLen).i32(6).op(OP.i32_mul).op(OP.i32_add).i32(64).op(OP.i32_add).call(F.ensureMem);
+    f.get(outBase).get(outLen).get(tmpDst).call(F.escapeJsonOut).set(tmpEnd);
+    f.get(tmpEnd).get(tmpDst).op(OP.i32_sub).set(escLen);
+    f.get(batchPtr).get(tmpDst).get(escLen).memCopy();
+    f.get(batchPtr).get(escLen).op(OP.i32_add).set(batchPtr);
+    f.end();
+
+    f.get(caseIdx).i32(1).op(OP.i32_add).set(caseIdx);
+    f.get(pos).get(end).op(OP.i32_lt_u).if_();
+    f.get(pos).load8().i32(44).op(OP.i32_eq).if_();
+    f.get(pos).i32(1).op(OP.i32_add).get(end).call(F.skipWs).set(pos);
+    f.br(2);
+    f.end();
+    f.end();
+    f.br(1).end().end();
+
+    expectByte(93); // ']'
+    f.get(pos).get(end).op(OP.i32_ne).if_().i32(-1).ret().end();
+    f.get(batchPtr).i32(16).op(OP.i32_add).call(F.ensureMem);
+    f.get(batchPtr).i32(93).store8();
+    f.get(batchPtr).i32(1).op(OP.i32_add).get(batchOutBase).op(OP.i32_sub);
+  });
+
+  // Encode WASM module into a single preallocated Uint8Array
+  const out = new Uint8Array(65536);
+  let p = 0;
+  out[p++] = 0x00; out[p++] = 0x61; out[p++] = 0x73; out[p++] = 0x6d;
+  out[p++] = 0x01; out[p++] = 0x00; out[p++] = 0x00; out[p++] = 0x00;
+
+  const beginSec = (id) => {
+    out[p++] = id;
+    const lenPos = p;
+    p += 5; // reserve 5-byte padded uleb128 length
+    return lenPos;
+  };
+  const endSec = (lenPos) => {
+    let len = p - (lenPos + 5);
+    for (let i = 0; i < 4; i++) {
+      out[lenPos + i] = (len & 0x7f) | 0x80;
+      len >>>= 7;
+    }
+    out[lenPos + 4] = len & 0x7f;
+  };
 
   // Type section (1)
-  const typeSec = [];
-  pushUleb(typeSec, types.length);
-  for (const t of types) {
-    typeSec.push(0x60);
-    pushUleb(typeSec, t.params.length);
-    for (const p of t.params) typeSec.push(p);
-    pushUleb(typeSec, t.results.length);
-    for (const r of t.results) typeSec.push(r);
+  let lp = beginSec(1);
+  p = writeUleb(out, p, types.length);
+  for (let i = 0; i < types.length; i++) {
+    const t = types[i];
+    out[p++] = 0x60;
+    p = writeUleb(out, p, t.params.length);
+    for (let j = 0; j < t.params.length; j++) out[p++] = t.params[j];
+    p = writeUleb(out, p, t.results.length);
+    for (let j = 0; j < t.results.length; j++) out[p++] = t.results[j];
   }
-  bytes.push(...encodeSection(1, typeSec));
+  endSec(lp);
 
   // Function section (3)
-  const funcSec = [];
-  pushUleb(funcSec, funcs.length);
-  for (const fn of funcs) pushUleb(funcSec, fn.typeIdx);
-  bytes.push(...encodeSection(3, funcSec));
+  lp = beginSec(3);
+  p = writeUleb(out, p, funcs.length);
+  for (let i = 0; i < funcs.length; i++) p = writeUleb(out, p, funcs[i].typeIdx);
+  endSec(lp);
 
   // Memory section (5): min 256 pages (16 MiB)
-  const memSec = [0x01, 0x00];
-  pushUleb(memSec, 256);
-  bytes.push(...encodeSection(5, memSec));
+  lp = beginSec(5);
+  out[p++] = 0x01; out[p++] = 0x00;
+  p = writeUleb(out, p, 256);
+  endSec(lp);
 
-  // Global section (6): all mutable i32 initialized to 0
-  const globSec = [];
-  pushUleb(globSec, globalCount);
+  // Global section (6)
+  lp = beginSec(6);
+  p = writeUleb(out, p, globalCount);
   for (let i = 0; i < globalCount; i++) {
-    globSec.push(I32, 0x01, OP.i32_const, 0x00, OP.end);
+    out[p++] = I32; out[p++] = 0x01; out[p++] = OP.i32_const; out[p++] = 0x00; out[p++] = OP.end;
   }
-  bytes.push(...encodeSection(6, globSec));
+  endSec(lp);
 
   // Export section (7)
   const exports = [
     ['memory', 0x02, 0],
     ['prepareInput', 0x00, F.prepareInput],
+    ['prepareBatch', 0x00, F.prepareBatch],
     ['solveAscii', 0x00, F.solveAscii],
+    ['solveBatchJson', 0x00, F.solveBatchJson],
     ['getOutBase', 0x00, F.getOutBase],
+    ['getBatchOutBase', 0x00, F.getBatchOutBase],
   ];
-  const expSec = [];
-  pushUleb(expSec, exports.length);
-  for (const [name, kind, idx] of exports) {
-    const nb = Buffer.from(name, 'utf8');
-    pushUleb(expSec, nb.length);
-    for (let i = 0; i < nb.length; i++) expSec.push(nb[i]);
-    expSec.push(kind);
-    pushUleb(expSec, idx);
+  lp = beginSec(7);
+  p = writeUleb(out, p, exports.length);
+  for (let i = 0; i < exports.length; i++) {
+    const [name, kind, idx] = exports[i];
+    p = writeUleb(out, p, name.length);
+    for (let j = 0; j < name.length; j++) out[p++] = name.charCodeAt(j);
+    out[p++] = kind;
+    p = writeUleb(out, p, idx);
   }
-  bytes.push(...encodeSection(7, expSec));
+  endSec(lp);
 
   // Code section (10)
-  const codeSec = [];
-  pushUleb(codeSec, funcs.length);
-  for (const fn of funcs) {
-    const body = [];
-    // Group consecutive locals of same type
+  lp = beginSec(10);
+  p = writeUleb(out, p, funcs.length);
+  const tmpLoc = new Uint8Array(64);
+  for (let i = 0; i < funcs.length; i++) {
+    const em = funcs[i].emitter;
+    const locs = em.locals;
+    let lp2 = 0;
     const groups = [];
-    for (const t of fn.emitter.locals) {
+    for (let j = 0; j < locs.length; j++) {
+      const t = locs[j];
       if (groups.length > 0 && groups[groups.length - 1][1] === t) groups[groups.length - 1][0]++;
       else groups.push([1, t]);
     }
-    pushUleb(body, groups.length);
-    for (const [cnt, t] of groups) {
-      pushUleb(body, cnt);
-      body.push(t);
+    lp2 = writeUleb(tmpLoc, lp2, groups.length);
+    for (let j = 0; j < groups.length; j++) {
+      lp2 = writeUleb(tmpLoc, lp2, groups[j][0]);
+      tmpLoc[lp2++] = groups[j][1];
     }
-    for (let i = 0; i < fn.emitter.code.length; i++) body.push(fn.emitter.code[i]);
-    pushUleb(codeSec, body.length);
-    for (let i = 0; i < body.length; i++) codeSec.push(body[i]);
+    p = writeUleb(out, p, lp2 + em.pos);
+    out.set(tmpLoc.subarray(0, lp2), p);
+    p += lp2;
+    out.set(em.buf.subarray(0, em.pos), p);
+    p += em.pos;
   }
-  bytes.push(...encodeSection(10, codeSec));
+  endSec(lp);
 
-  const mod = new WebAssembly.Module(new Uint8Array(bytes));
+  const mod = new WebAssembly.Module(out.subarray(0, p));
   return new WebAssembly.Instance(mod).exports;
 }
