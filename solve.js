@@ -1,8 +1,13 @@
-import { closeSync, fstatSync, openSync, readSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
 import { buildDiffWasm } from './wasm-core.js';
 
 export const FORMAT = 'makefun-diff/1';
 export const CONTEXT = 3;
+
+const WIN_BASE = 64;
+const INIT_WIN_CAP = 2588672; // 2.47 MB sliding window so each practice case fits in-place
+const OPEN_BRACKET = Buffer.from('[');
+const CLOSE_BRACKET = Buffer.from(']');
 
 const wasm = buildDiffWasm();
 let memBuf = Buffer.from(wasm.memory.buffer);
@@ -19,6 +24,14 @@ function countLinesStr(str) {
     p = nl + 1;
   }
   return cnt;
+}
+
+function getUtf16() {
+  if (!utf16Mod) {
+    const { createRequire } = process.getBuiltinModule('node:module');
+    utf16Mod = createRequire(import.meta.url)('./utf16-fallback.cjs');
+  }
+  return utf16Mod;
 }
 
 export function diffPatch(input) {
@@ -48,43 +61,94 @@ export function diffPatch(input) {
     }
   }
 
-  if (!utf16Mod) {
-    const { createRequire } = process.getBuiltinModule('node:module');
-    utf16Mod = createRequire(import.meta.url)('./utf16-fallback.cjs');
-  }
-  return utf16Mod.diffPatchUtf16(oldStr, newStr);
+  return getUtf16().diffPatchUtf16(oldStr, newStr);
 }
 
 export function run(input) {
   return diffPatch(input);
 }
 
-export function runCasesFile(inputPath, outputPath) {
-  const fd = openSync(inputPath, 'r');
-  const size = fstatSync(fd).size;
-  const jsonBase = wasm.prepareBatch(size);
-  if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+function readFill(fd, buf, offset, maxBytes) {
   let got = 0;
-  while (got < size) {
-    const n = readSync(fd, memBuf, jsonBase + got, size - got, got);
-    if (n === 0) break;
+  let eof = 0;
+  while (got < maxBytes) {
+    const n = readSync(fd, buf, offset + got, maxBytes - got, null);
+    if (n === 0) { eof = 1; break; }
     got += n;
   }
-  closeSync(fd);
+  return [got, eof];
+}
 
-  const outLen = wasm.solveBatchJson();
-  if (outLen >= 0) {
+function writeAll(fd, buf, off, len) {
+  let w = 0;
+  while (w < len) {
+    w += writeSync(fd, buf, off + w, len - w);
+  }
+}
+
+export function runCasesFile(inputPath, outputPath) {
+  let winCap = INIT_WIN_CAP;
+  const fd = openSync(inputPath, 'r');
+  const outFd = openSync(outputPath, 'w');
+  let winLen = 0;
+  let eof = 0;
+  try {
+    wasm.ensureWin(WIN_BASE + winCap);
     if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
-    const outBase = wasm.getBatchOutBase();
-    writeFileSync(outputPath, memBuf.subarray(outBase, outBase + outLen));
-    return;
+    const [got0, eof0] = readFill(fd, memBuf, WIN_BASE, winCap);
+    winLen = got0;
+    eof = eof0;
+    wasm.streamInit(WIN_BASE, WIN_BASE + winLen, eof, WIN_BASE + winCap);
+
+    for (;;) {
+      const rc = wasm.streamNext();
+      if (rc > 0) {
+        if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+        writeAll(outFd, memBuf, wasm.getStreamOutBase(), rc);
+      } else if (rc === 0) {
+        if (wasm.getCaseIdx() === 0) writeAll(outFd, OPEN_BRACKET, 0, 1);
+        writeAll(outFd, CLOSE_BRACKET, 0, 1);
+        return;
+      } else if (rc === -2) {
+        if (eof) break;
+        if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+        const keep = wasm.getWinKeep();
+        const rem = WIN_BASE + winLen - keep;
+        if (keep === WIN_BASE && rem >= winCap) {
+          winCap *= 2;
+          wasm.ensureWin(WIN_BASE + winCap);
+          if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+          const [got, eofNow] = readFill(fd, memBuf, WIN_BASE + rem, winCap - rem);
+          winLen = rem + got;
+          eof = eofNow;
+        } else {
+          if (rem > 0) memBuf.copyWithin(WIN_BASE, keep, WIN_BASE + winLen);
+          const [got, eofNow] = readFill(fd, memBuf, WIN_BASE + rem, winCap - rem);
+          winLen = rem + got;
+          eof = eofNow;
+        }
+        wasm.streamRefill(WIN_BASE + winLen, eof, WIN_BASE + winCap);
+      } else if (rc === -3) {
+        if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
+        const cs = wasm.getCaseStart();
+        const ce = wasm.getCaseEnd();
+        const c = JSON.parse(memBuf.toString('utf8', cs, ce));
+        const ans = JSON.stringify(diffPatch(c.input));
+        const prefix = wasm.getCaseIdx() === 1 ? '[' : ',';
+        const chunk = Buffer.from(prefix + ans, 'utf8');
+        writeAll(outFd, chunk, 0, chunk.length);
+      } else {
+        break;
+      }
+    }
+  } finally {
+    closeSync(fd);
+    closeSync(outFd);
   }
 
-  if (memBuf.buffer !== wasm.memory.buffer) memBuf = Buffer.from(wasm.memory.buffer);
-  const cases = JSON.parse(memBuf.toString('utf8', jsonBase, jsonBase + got));
+  // Fallback for non-standard JSON formatting
+  const cases = JSON.parse(readFileSync(inputPath, 'utf8'));
   const answers = new Array(cases.length);
-  for (let i = 0; i < cases.length; i++) {
-    answers[i] = diffPatch(cases[i].input);
-  }
+  for (let i = 0; i < cases.length; i++) answers[i] = diffPatch(cases[i].input);
   writeFileSync(outputPath, JSON.stringify(answers));
 }
